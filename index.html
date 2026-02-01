@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebSDR - RTL-TCP Client</title>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-tertiary: #0f3460;
+            --accent: #e94560;
+            --accent-hover: #ff6b6b;
+            --text-primary: #eee;
+            --text-secondary: #aaa;
+            --border: #333;
+            --success: #4ade80;
+            --warning: #fbbf24;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .app-container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            max-height: 100vh;
+        }
+
+        /* Header */
+        header {
+            background: var(--bg-secondary);
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .logo {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--accent);
+        }
+
+        .status-dot.connected {
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Main content */
+        main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            padding: 0.5rem;
+            gap: 0.5rem;
+        }
+
+        /* Connection Panel */
+        .connection-panel {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 1rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .input-group label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        input, select {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.5rem 0.75rem;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input:focus, select:focus {
+            border-color: var(--accent);
+        }
+
+        input[type="number"] {
+            width: 120px;
+        }
+
+        .freq-input {
+            width: 150px !important;
+            font-family: 'Courier New', monospace;
+            font-size: 1rem;
+            font-weight: bold;
+        }
+
+        button {
+            background: var(--accent);
+            border: none;
+            border-radius: 4px;
+            padding: 0.5rem 1rem;
+            color: white;
+            font-size: 0.875rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+        }
+
+        button:hover {
+            background: var(--accent-hover);
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        button:disabled {
+            background: var(--border);
+            cursor: not-allowed;
+        }
+
+        .btn-connect {
+            padding: 0.5rem 1.5rem;
+        }
+
+        .btn-disconnect {
+            background: #ef4444;
+        }
+
+        /* Controls Panel */
+        .controls-panel {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 1rem;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            flex-shrink: 0;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .control-label {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .control-label span {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .control-value {
+            font-family: 'Courier New', monospace;
+            font-size: 0.875rem;
+            color: var(--accent);
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 6px;
+            background: var(--bg-tertiary);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            background: var(--accent);
+            border-radius: 50%;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.1);
+        }
+
+        .mode-buttons {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .mode-btn {
+            flex: 1;
+            padding: 0.5rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            font-size: 0.75rem;
+        }
+
+        .mode-btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        /* Visualization Area */
+        .visualization {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+            min-height: 0;
+        }
+
+        .canvas-container {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .spectrum-container {
+            flex: 1.2;
+            min-height: 80px;
+        }
+
+        .waterfall-container {
+            flex: 2;
+            min-height: 100px;
+        }
+
+        .waveform-container {
+            flex: 0.8;
+            min-height: 60px;
+        }
+
+        .canvas-container canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        .canvas-label {
+            position: absolute;
+            top: 0.5rem;
+            left: 0.5rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            background: rgba(0,0,0,0.5);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+        }
+
+        .freq-scale {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 20px;
+            display: flex;
+            justify-content: space-between;
+            padding: 0 0.5rem;
+            font-size: 0.625rem;
+            color: var(--text-secondary);
+            background: rgba(0,0,0,0.3);
+        }
+
+        /* Audio controls */
+        .audio-controls {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-shrink: 0;
+        }
+
+        .play-btn {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+        }
+
+        .volume-control {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex: 1;
+            max-width: 200px;
+        }
+
+        .volume-icon {
+            font-size: 1.25rem;
+        }
+
+        .audio-meter {
+            flex: 1;
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .audio-meter-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--success), var(--warning), var(--accent));
+            width: 0%;
+            transition: width 0.05s;
+        }
+
+        /* Stats bar */
+        .stats-bar {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            flex-wrap: wrap;
+        }
+
+        .stat {
+            display: flex;
+            gap: 0.25rem;
+        }
+
+        .stat-value {
+            color: var(--text-primary);
+            font-family: 'Courier New', monospace;
+        }
+
+        /* Mobile optimizations */
+        @media (max-width: 768px) {
+            header {
+                padding: 0.5rem;
+            }
+
+            .logo {
+                font-size: 1rem;
+            }
+
+            main {
+                padding: 0.25rem;
+                gap: 0.25rem;
+            }
+
+            .connection-panel {
+                padding: 0.75rem;
+            }
+
+            .controls-panel {
+                padding: 0.75rem;
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .input-group input,
+            .input-group select {
+                width: 100%;
+            }
+
+            .freq-input {
+                width: 100% !important;
+            }
+
+            .visualization {
+                flex-direction: column;
+            }
+
+            .canvas-container {
+                min-height: 120px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .controls-panel {
+                grid-template-columns: 1fr;
+            }
+
+            .connection-panel {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .input-group {
+                width: 100%;
+            }
+        }
+
+        /* Landscape mobile */
+        @media (max-height: 500px) and (orientation: landscape) {
+            .visualization {
+                flex-direction: row;
+            }
+
+            .canvas-container {
+                min-height: 80px;
+            }
+        }
+
+        /* Tuning dial indicator - appears on both waterfall and waveform */
+        .tuning-indicator {
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 2px;
+            height: 100%;
+            background: var(--accent);
+            opacity: 0.8;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        /* Prominent Frequency Control Panel */
+        .frequency-panel {
+            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            flex-shrink: 0;
+            border: 1px solid var(--border);
+        }
+
+        .frequency-display {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .frequency-main {
+            font-family: 'Courier New', monospace;
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: var(--accent);
+            letter-spacing: 2px;
+            text-shadow: 0 0 20px rgba(233, 69, 96, 0.3);
+            cursor: pointer;
+            user-select: none;
+            min-width: 280px;
+            text-align: center;
+        }
+
+        .frequency-main:hover {
+            color: var(--accent-hover);
+        }
+
+        .frequency-unit {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            margin-left: 0.25rem;
+        }
+
+        .frequency-controls {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .freq-step-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            padding: 0.5rem 0.75rem;
+            font-size: 0.75rem;
+            font-family: 'Courier New', monospace;
+            min-width: 60px;
+        }
+
+        .freq-step-btn:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .freq-step-btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .freq-adjust-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            width: 40px;
+            height: 40px;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+        }
+
+        .freq-adjust-btn:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .freq-input-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .freq-direct-input {
+            width: 180px;
+            font-family: 'Courier New', monospace;
+            font-size: 1.1rem;
+            text-align: center;
+            padding: 0.5rem 1rem;
+        }
+
+        .freq-go-btn {
+            padding: 0.5rem 1rem;
+        }
+
+        /* Clickable canvas cursor */
+        .canvas-container canvas {
+            cursor: crosshair;
+        }
+
+        /* Loading overlay */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.8);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .loading-overlay.active {
+            display: flex;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Error toast */
+        .toast {
+            position: fixed;
+            bottom: 1rem;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--bg-secondary);
+            border: 1px solid var(--accent);
+            border-radius: 8px;
+            padding: 0.75rem 1.5rem;
+            font-size: 0.875rem;
+            z-index: 1001;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+        }
+
+        .toast.show {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">📻 WebSDR</div>
+            <div class="connection-status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Disconnected</span>
+            </div>
+        </header>
+
+        <main>
+            <!-- Prominent Frequency Control Panel -->
+            <div class="frequency-panel">
+                <div class="frequency-display">
+                    <button class="freq-adjust-btn" id="freqDown" title="Decrease frequency">−</button>
+                    <div class="frequency-main" id="frequencyDisplay" title="Click to edit">100.000<span class="frequency-unit">MHz</span></div>
+                    <button class="freq-adjust-btn" id="freqUp" title="Increase frequency">+</button>
+                </div>
+                <div class="frequency-controls">
+                    <button class="freq-step-btn" data-step="0.001">1 kHz</button>
+                    <button class="freq-step-btn" data-step="0.01">10 kHz</button>
+                    <button class="freq-step-btn" data-step="0.025">25 kHz</button>
+                    <button class="freq-step-btn active" data-step="0.1">100 kHz</button>
+                    <button class="freq-step-btn" data-step="1">1 MHz</button>
+                </div>
+                <div class="freq-input-row">
+                    <input type="number" id="frequency" class="freq-direct-input" value="100.000" step="0.001" min="24" max="1766" placeholder="Enter frequency">
+                    <button class="freq-go-btn" id="freqGoBtn">Go</button>
+                </div>
+            </div>
+
+            <!-- Connection Panel -->
+            <div class="connection-panel">
+                <div class="input-group">
+                    <label>WebSocket Host</label>
+                    <input type="text" id="wsHost" value="192.168.1.126" placeholder="Host IP">
+                </div>
+                <div class="input-group">
+                    <label>WS Port</label>
+                    <input type="number" id="wsPort" value="8081" min="1" max="65535">
+                </div>
+                <div class="input-group">
+                    <label>Sample Rate</label>
+                    <select id="sampleRate">
+                        <option value="250000">250 kHz</option>
+                        <option value="1024000">1.024 MHz</option>
+                        <option value="1800000">1.8 MHz</option>
+                        <option value="2048000" selected>2.048 MHz</option>
+                        <option value="2400000">2.4 MHz</option>
+                    </select>
+                </div>
+                <button class="btn-connect" id="connectBtn">Connect</button>
+            </div>
+
+            <!-- Controls Panel -->
+            <div class="controls-panel">
+                <div class="control-group">
+                    <div class="control-label">
+                        <span>Gain</span>
+                        <span class="control-value" id="gainValue">Auto</span>
+                    </div>
+                    <input type="range" id="gainSlider" min="0" max="50" value="0">
+                </div>
+
+                <div class="control-group">
+                    <div class="control-label">
+                        <span>Squelch</span>
+                        <span class="control-value" id="squelchValue">Off</span>
+                    </div>
+                    <input type="range" id="squelchSlider" min="0" max="100" value="0">
+                </div>
+
+                <div class="control-group">
+                    <div class="control-label">
+                        <span>Filter BW</span>
+                        <span class="control-value" id="filterValue">Auto</span>
+                    </div>
+                    <input type="range" id="filterSlider" min="0" max="100" value="50">
+                </div>
+
+                <div class="control-group">
+                    <div class="control-label">
+                        <span>Mode</span>
+                    </div>
+                    <div class="mode-buttons">
+                        <button class="mode-btn active" data-mode="wfm">WFM</button>
+                        <button class="mode-btn" data-mode="nfm">NFM</button>
+                        <button class="mode-btn" data-mode="am">AM</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Visualization -->
+            <div class="visualization">
+                <div class="canvas-container spectrum-container" id="spectrumContainer">
+                    <span class="canvas-label">Spectrum</span>
+                    <canvas id="spectrumCanvas"></canvas>
+                    <div class="tuning-indicator"></div>
+                </div>
+                <div class="canvas-container waterfall-container" id="waterfallContainer">
+                    <span class="canvas-label">Waterfall</span>
+                    <canvas id="waterfallCanvas"></canvas>
+                    <div class="tuning-indicator"></div>
+                    <div class="freq-scale" id="freqScale"></div>
+                </div>
+                <div class="canvas-container waveform-container" id="waveformContainer">
+                    <span class="canvas-label">Waveform</span>
+                    <canvas id="waveformCanvas"></canvas>
+                    <div class="tuning-indicator"></div>
+                </div>
+            </div>
+
+            <!-- Audio Controls -->
+            <div class="audio-controls">
+                <button class="play-btn" id="playBtn">▶</button>
+                <div class="volume-control">
+                    <span class="volume-icon">🔊</span>
+                    <input type="range" id="volumeSlider" min="0" max="100" value="50">
+                </div>
+                <div class="audio-meter">
+                    <div class="audio-meter-fill" id="audioMeter"></div>
+                </div>
+                <div class="stats-bar">
+                    <div class="stat">Buffer: <span class="stat-value" id="bufferStat">0</span></div>
+                    <div class="stat">Rate: <span class="stat-value" id="rateStat">0 kS/s</span></div>
+                    <div class="stat">Signal: <span class="stat-value" id="signalStat">-∞ dB</span></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="sdr.js"></script>
+</body>
+</html>
