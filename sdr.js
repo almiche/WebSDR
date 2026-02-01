@@ -776,30 +776,43 @@ class WebSDRApp {
             this.toggleAudio();
         });
 
-        // Frequency input (direct entry)
-        document.getElementById('frequency').addEventListener('change', (e) => {
+        // Main frequency display input (the big red one)
+        const freqDisplay = document.getElementById('frequencyDisplay');
+        let freqInputTimeout = null;
+
+        // Auto-update while typing (debounced)
+        freqDisplay.addEventListener('input', (e) => {
+            clearTimeout(freqInputTimeout);
+            freqInputTimeout = setTimeout(() => {
+                const freqMHz = parseFloat(e.target.value);
+                if (!isNaN(freqMHz) && freqMHz >= 24 && freqMHz <= 1766) {
+                    this.setFrequency(freqMHz);
+                }
+            }, 300); // Update after 300ms of no typing
+        });
+
+        freqDisplay.addEventListener('change', (e) => {
+            clearTimeout(freqInputTimeout);
             const freqMHz = parseFloat(e.target.value);
             if (!isNaN(freqMHz)) {
                 this.setFrequency(freqMHz);
             }
         });
 
-        // Frequency Go button
-        document.getElementById('freqGoBtn').addEventListener('click', () => {
-            const freqMHz = parseFloat(document.getElementById('frequency').value);
-            if (!isNaN(freqMHz)) {
-                this.setFrequency(freqMHz);
-            }
-        });
-
-        // Enter key on frequency input
-        document.getElementById('frequency').addEventListener('keypress', (e) => {
+        freqDisplay.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
+                clearTimeout(freqInputTimeout);
+                e.target.blur();
                 const freqMHz = parseFloat(e.target.value);
                 if (!isNaN(freqMHz)) {
                     this.setFrequency(freqMHz);
                 }
             }
+        });
+
+        // Select all text when clicking on frequency display
+        freqDisplay.addEventListener('focus', (e) => {
+            e.target.select();
         });
 
         // Frequency up/down buttons
@@ -820,11 +833,6 @@ class WebSDRApp {
             });
         });
 
-        // Click on frequency display to focus input
-        document.getElementById('frequencyDisplay').addEventListener('click', () => {
-            document.getElementById('frequency').focus();
-            document.getElementById('frequency').select();
-        });
 
         // Sample rate
         document.getElementById('sampleRate').addEventListener('change', (e) => {
@@ -943,44 +951,107 @@ class WebSDRApp {
     // Setup click, drag, and touch interactions for a canvas
     setupCanvasInteraction(canvasId) {
         const canvas = document.getElementById(canvasId);
+        let startX = 0;
+        let startCenterFreq = 0;
+        let hasMoved = false;
+        let isMouseDown = false;
 
-        // Click to tune (for quick taps)
-        canvas.addEventListener('click', (e) => {
-            if (this.isDragging) return; // Ignore clicks during drag
-            this.handleCanvasTune(e, canvas);
-        });
-
-        // Mouse drag for scrolling frequency
+        // Mouse events
         canvas.addEventListener('mousedown', (e) => {
-            this.startDrag(e, canvas);
+            isMouseDown = true;
+            hasMoved = false;
+            startX = e.clientX;
+            startCenterFreq = this.centerFrequency;
+            e.preventDefault();
         });
 
-        document.addEventListener('mousemove', (e) => {
-            if (this.isDragging && this.dragCanvas === canvas) {
-                this.handleDrag(e, canvas);
+        const handleMouseMove = (e) => {
+            if (!isMouseDown) return;
+
+            const deltaX = e.clientX - startX;
+
+            // Only consider it a drag after moving more than 3 pixels
+            if (Math.abs(deltaX) > 3) {
+                hasMoved = true;
+                this.isDragging = true;
+
+                const rect = canvas.getBoundingClientRect();
+                const sampleRate = parseInt(document.getElementById('sampleRate').value);
+
+                // Pan: dragging right = lower freq, dragging left = higher freq
+                const freqShift = -(deltaX / rect.width) * sampleRate;
+                const newCenterFreq = startCenterFreq + (freqShift / 1e6);
+
+                this.setCenterFrequency(newCenterFreq, false);
             }
-        });
+        };
 
-        document.addEventListener('mouseup', () => {
-            this.endDrag();
-        });
+        const handleMouseUp = (e) => {
+            if (!isMouseDown) return;
+            isMouseDown = false;
 
-        // Touch support for mobile
+            if (hasMoved) {
+                // Finished dragging - send final frequency
+                const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
+                if (this.isConnected) {
+                    this.rtl.setFrequency(tunedFreq * 1e6);
+                }
+            } else {
+                // It was a click, not a drag - tune to clicked position
+                this.handleCanvasTune(e, canvas);
+            }
+
+            this.isDragging = false;
+            hasMoved = false;
+        };
+
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+
+        // Touch events
         canvas.addEventListener('touchstart', (e) => {
             if (e.touches.length === 1) {
-                this.startDrag(e.touches[0], canvas);
+                isMouseDown = true;
+                hasMoved = false;
+                startX = e.touches[0].clientX;
+                startCenterFreq = this.centerFrequency;
             }
         }, { passive: true });
 
         canvas.addEventListener('touchmove', (e) => {
-            if (this.isDragging && e.touches.length === 1) {
+            if (!isMouseDown || e.touches.length !== 1) return;
+
+            const deltaX = e.touches[0].clientX - startX;
+
+            if (Math.abs(deltaX) > 3) {
+                hasMoved = true;
+                this.isDragging = true;
                 e.preventDefault();
-                this.handleDrag(e.touches[0], canvas);
+
+                const rect = canvas.getBoundingClientRect();
+                const sampleRate = parseInt(document.getElementById('sampleRate').value);
+
+                const freqShift = -(deltaX / rect.width) * sampleRate;
+                const newCenterFreq = startCenterFreq + (freqShift / 1e6);
+
+                this.setCenterFrequency(newCenterFreq, false);
             }
         }, { passive: false });
 
-        canvas.addEventListener('touchend', () => {
-            this.endDrag();
+        canvas.addEventListener('touchend', (e) => {
+            if (!isMouseDown) return;
+            isMouseDown = false;
+
+            if (hasMoved) {
+                const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
+                if (this.isConnected) {
+                    this.rtl.setFrequency(tunedFreq * 1e6);
+                }
+            }
+            // Note: touchend doesn't provide position, so no click-to-tune on touch
+
+            this.isDragging = false;
+            hasMoved = false;
         });
     }
 
@@ -1001,51 +1072,6 @@ class WebSDRApp {
         // Calculate and set the tuned frequency
         const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
         this.setTunedFrequency(tunedFreq);
-    }
-
-    startDrag(e, canvas) {
-        this.isDragging = false; // Will be set to true after movement threshold
-        this.dragCanvas = canvas;
-        this.dragStartX = e.clientX;
-        this.dragStartCenterFreq = this.centerFrequency;
-        this.dragMoved = 0;
-    }
-
-    // SDR++ style: Drag pans the entire view (changes center frequency)
-    handleDrag(e, canvas) {
-        const deltaX = e.clientX - this.dragStartX;
-        this.dragMoved += Math.abs(deltaX - (this.lastDeltaX || 0));
-        this.lastDeltaX = deltaX;
-
-        // Only consider it a drag after moving more than 5 pixels
-        if (this.dragMoved > 5) {
-            this.isDragging = true;
-        }
-
-        if (this.isDragging) {
-            const rect = canvas.getBoundingClientRect();
-            const sampleRate = parseInt(document.getElementById('sampleRate').value);
-
-            // Pan the view: dragging right shows lower frequencies, left shows higher
-            const freqShift = -(deltaX / rect.width) * sampleRate;
-            const newCenterFreq = this.dragStartCenterFreq + (freqShift / 1e6);
-
-            this.setCenterFrequency(newCenterFreq, false); // Don't send to RTL during drag
-        }
-    }
-
-    endDrag() {
-        if (this.isDragging) {
-            // Send final tuned frequency to RTL when drag ends
-            const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
-            if (this.isConnected) {
-                this.rtl.setFrequency(tunedFreq * 1e6);
-            }
-        }
-        this.isDragging = false;
-        this.dragCanvas = null;
-        this.dragMoved = 0;
-        this.lastDeltaX = 0;
     }
 
     // Update the visual position of all indicator lines
@@ -1100,10 +1126,7 @@ class WebSDRApp {
         this.indicatorPosition = 50;
         this.updateIndicatorPosition();
 
-        // Update input field
-        document.getElementById('frequency').value = freqMHz.toFixed(3);
-
-        // Update large display
+        // Update the frequency display
         this.updateFrequencyDisplay(freqMHz);
 
         // Update frequency scale
@@ -1124,7 +1147,10 @@ class WebSDRApp {
     // Update the large frequency display
     updateFrequencyDisplay(freqMHz) {
         const display = document.getElementById('frequencyDisplay');
-        display.innerHTML = `${freqMHz.toFixed(3)}<span class="frequency-unit">MHz</span>`;
+        // Only update if not focused (to avoid disrupting user input)
+        if (document.activeElement !== display) {
+            display.value = freqMHz.toFixed(3);
+        }
     }
 
     async connect() {

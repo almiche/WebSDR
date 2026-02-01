@@ -254,13 +254,14 @@
             border-color: var(--accent);
         }
 
-        /* Visualization Area - takes up 2/3 of available space */
+        /* Visualization Area - takes up most of available space */
         .visualization {
-            flex: 2;
+            flex: 1;
             display: flex;
             flex-direction: column;
             gap: 0.25rem;
-            min-height: 0;
+            min-height: 200px;
+            overflow: hidden;
         }
 
         .canvas-container {
@@ -272,16 +273,16 @@
 
         .spectrum-container {
             flex: 1;
-            min-height: 60px;
+            min-height: 80px;
         }
 
         .waterfall-container {
             flex: 2;
-            min-height: 80px;
+            min-height: 120px;
         }
 
         .waveform-container {
-            flex: 0.6;
+            flex: 0.5;
             min-height: 50px;
         }
 
@@ -500,20 +501,33 @@
         }
 
         .frequency-main {
+            display: flex;
+            align-items: baseline;
+            justify-content: center;
+        }
+
+        .frequency-main-input {
             font-family: 'Courier New', monospace;
             font-size: 2rem;
             font-weight: bold;
             color: var(--accent);
             letter-spacing: 2px;
             text-shadow: 0 0 20px rgba(233, 69, 96, 0.3);
-            cursor: pointer;
-            user-select: none;
-            min-width: 220px;
-            text-align: center;
+            background: transparent;
+            border: none;
+            outline: none;
+            width: 180px;
+            text-align: right;
+            cursor: text;
         }
 
-        .frequency-main:hover {
+        .frequency-main-input:hover {
             color: var(--accent-hover);
+        }
+
+        .frequency-main-input:focus {
+            background: rgba(233, 69, 96, 0.1);
+            border-radius: 4px;
         }
 
         .frequency-unit {
@@ -656,7 +670,10 @@
             <div class="frequency-panel">
                 <div class="frequency-display">
                     <button class="freq-adjust-btn" id="freqDown" title="Decrease frequency">−</button>
-                    <div class="frequency-main" id="frequencyDisplay" title="Click to edit">100.000<span class="frequency-unit">MHz</span></div>
+                    <div class="frequency-main">
+                        <input type="text" id="frequencyDisplay" class="frequency-main-input" value="100.000" title="Click to edit frequency">
+                        <span class="frequency-unit">MHz</span>
+                    </div>
                     <button class="freq-adjust-btn" id="freqUp" title="Increase frequency">+</button>
                 </div>
                 <div class="frequency-controls">
@@ -665,10 +682,6 @@
                     <button class="freq-step-btn" data-step="0.025">25 kHz</button>
                     <button class="freq-step-btn active" data-step="0.1">100 kHz</button>
                     <button class="freq-step-btn" data-step="1">1 MHz</button>
-                </div>
-                <div class="freq-input-row">
-                    <input type="number" id="frequency" class="freq-direct-input" value="100.000" step="0.001" min="24" max="1766" placeholder="Enter frequency">
-                    <button class="freq-go-btn" id="freqGoBtn">Go</button>
                 </div>
             </div>
 
