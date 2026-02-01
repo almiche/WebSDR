@@ -689,6 +689,11 @@ class WebSDRApp {
         this.dragStartX = 0;
         this.dragStartFreq = 0;
 
+        // SDR++ style: centerFreq is the display center, tuneOffset is where the red line is
+        this.centerFrequency = 100.0; // MHz - center of the display
+        this.tuneOffset = 0; // Hz offset from center where we're tuned
+        this.indicatorPosition = 50; // Percentage position of the indicator (0-100)
+
         this.init();
     }
 
@@ -702,11 +707,15 @@ class WebSDRApp {
         // Bind UI events
         this.bindEvents();
 
-        // Initialize frequency display
+        // Initialize frequency from input
         const initialFreq = parseFloat(document.getElementById('frequency').value);
-        this.updateFrequencyDisplay(initialFreq);
+        this.centerFrequency = initialFreq;
+        this.tuneOffset = 0;
+        this.indicatorPosition = 50;
 
-        // Update frequency scale
+        // Update displays
+        this.updateFrequencyDisplay(initialFreq);
+        this.updateIndicatorPosition();
         this.updateFreqScale();
     }
 
@@ -913,27 +922,34 @@ class WebSDRApp {
         });
     }
 
+    // SDR++ style: Click moves the indicator to that position
     handleCanvasTune(e, canvas) {
         const rect = canvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const width = rect.width;
 
-        const sampleRate = parseInt(document.getElementById('sampleRate').value);
-        const centerFreq = parseFloat(document.getElementById('frequency').value) * 1e6;
-        const offset = (x / width - 0.5) * sampleRate;
-        const newFreq = centerFreq + offset;
+        // Move the indicator to the clicked position
+        this.indicatorPosition = (x / width) * 100;
+        this.updateIndicatorPosition();
 
-        this.setFrequency(newFreq / 1e6);
+        // Calculate the actual frequency at this position
+        const sampleRate = parseInt(document.getElementById('sampleRate').value);
+        this.tuneOffset = (this.indicatorPosition / 100 - 0.5) * sampleRate;
+
+        // Calculate and set the tuned frequency
+        const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
+        this.setTunedFrequency(tunedFreq);
     }
 
     startDrag(e, canvas) {
         this.isDragging = false; // Will be set to true after movement threshold
         this.dragCanvas = canvas;
         this.dragStartX = e.clientX;
-        this.dragStartFreq = parseFloat(document.getElementById('frequency').value);
+        this.dragStartCenterFreq = this.centerFrequency;
         this.dragMoved = 0;
     }
 
+    // SDR++ style: Drag pans the entire view (changes center frequency)
     handleDrag(e, canvas) {
         const deltaX = e.clientX - this.dragStartX;
         this.dragMoved += Math.abs(deltaX - (this.lastDeltaX || 0));
@@ -947,21 +963,21 @@ class WebSDRApp {
         if (this.isDragging) {
             const rect = canvas.getBoundingClientRect();
             const sampleRate = parseInt(document.getElementById('sampleRate').value);
-            // Calculate frequency offset based on drag distance
-            // Dragging left increases frequency, dragging right decreases
-            const freqOffset = -(deltaX / rect.width) * (sampleRate / 1e6);
-            const newFreq = this.dragStartFreq + freqOffset;
 
-            this.setFrequency(newFreq, false); // Don't send to RTL during drag
+            // Pan the view: dragging right shows lower frequencies, left shows higher
+            const freqShift = -(deltaX / rect.width) * sampleRate;
+            const newCenterFreq = this.dragStartCenterFreq + (freqShift / 1e6);
+
+            this.setCenterFrequency(newCenterFreq, false); // Don't send to RTL during drag
         }
     }
 
     endDrag() {
         if (this.isDragging) {
-            // Send final frequency to RTL when drag ends
-            const freq = parseFloat(document.getElementById('frequency').value);
+            // Send final tuned frequency to RTL when drag ends
+            const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
             if (this.isConnected) {
-                this.rtl.setFrequency(freq * 1e6);
+                this.rtl.setFrequency(tunedFreq * 1e6);
             }
         }
         this.isDragging = false;
@@ -970,10 +986,57 @@ class WebSDRApp {
         this.lastDeltaX = 0;
     }
 
-    // Set frequency and update all displays
+    // Update the visual position of all indicator lines
+    updateIndicatorPosition() {
+        const pos = `${this.indicatorPosition}%`;
+        document.getElementById('spectrumIndicator').style.left = pos;
+        document.getElementById('waterfallIndicator').style.left = pos;
+        document.getElementById('waveformIndicator').style.left = pos;
+    }
+
+    // Set the center frequency of the display (for panning)
+    setCenterFrequency(freqMHz, sendToRTL = true) {
+        freqMHz = Math.max(24, Math.min(1766, freqMHz));
+        this.centerFrequency = freqMHz;
+
+        // Update the frequency scale
+        this.updateFreqScale();
+
+        // The tuned frequency is center + offset
+        const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
+
+        // Update displays
+        document.getElementById('frequency').value = tunedFreq.toFixed(3);
+        this.updateFrequencyDisplay(tunedFreq);
+
+        if (sendToRTL && this.isConnected) {
+            this.rtl.setFrequency(tunedFreq * 1e6);
+        }
+    }
+
+    // Set the tuned frequency (where the red line is)
+    setTunedFrequency(freqMHz, sendToRTL = true) {
+        freqMHz = Math.max(24, Math.min(1766, freqMHz));
+
+        // Update displays
+        document.getElementById('frequency').value = freqMHz.toFixed(3);
+        this.updateFrequencyDisplay(freqMHz);
+
+        if (sendToRTL && this.isConnected) {
+            this.rtl.setFrequency(freqMHz * 1e6);
+        }
+    }
+
+    // Set frequency - this sets both center and moves indicator to center
     setFrequency(freqMHz, sendToRTL = true) {
         // Clamp to valid range
         freqMHz = Math.max(24, Math.min(1766, freqMHz));
+
+        // Set as center frequency with indicator at center
+        this.centerFrequency = freqMHz;
+        this.tuneOffset = 0;
+        this.indicatorPosition = 50;
+        this.updateIndicatorPosition();
 
         // Update input field
         document.getElementById('frequency').value = freqMHz.toFixed(3);
@@ -990,11 +1053,10 @@ class WebSDRApp {
         }
     }
 
-    // Adjust frequency by delta
+    // Adjust frequency by delta - pans the view
     adjustFrequency(deltaMHz) {
-        const currentFreq = parseFloat(document.getElementById('frequency').value);
-        const newFreq = currentFreq + deltaMHz;
-        this.setFrequency(newFreq);
+        const newCenterFreq = this.centerFrequency + deltaMHz;
+        this.setCenterFrequency(newCenterFreq);
     }
 
     // Update the large frequency display
@@ -1021,6 +1083,11 @@ class WebSDRApp {
             const sampleRate = parseInt(document.getElementById('sampleRate').value);
             const gain = parseInt(document.getElementById('gainSlider').value);
 
+            // Initialize frequency model
+            this.centerFrequency = freqMHz;
+            this.tuneOffset = 0;
+            this.indicatorPosition = 50;
+
             this.rtl.setFrequency(freqMHz * 1e6);
             this.rtl.setSampleRate(sampleRate);
             this.rtl.setGain(gain);
@@ -1028,6 +1095,7 @@ class WebSDRApp {
 
             // Update displays
             this.updateFrequencyDisplay(freqMHz);
+            this.updateIndicatorPosition();
             this.updateFreqScale();
 
             // Set up data handler
@@ -1155,7 +1223,7 @@ class WebSDRApp {
 
     updateFreqScale() {
         const scale = document.getElementById('freqScale');
-        const centerFreq = parseFloat(document.getElementById('frequency').value);
+        const centerFreq = this.centerFrequency; // Use the display center frequency
         const sampleRate = parseInt(document.getElementById('sampleRate').value);
         const halfBW = sampleRate / 2e6; // In MHz
 
@@ -1166,7 +1234,7 @@ class WebSDRApp {
             <span>${(centerFreq - halfBW + step).toFixed(3)}</span>
             <span>${(centerFreq - halfBW/2).toFixed(3)}</span>
             <span>${(centerFreq - step).toFixed(3)}</span>
-            <span style="color: var(--accent); font-weight: bold;">${centerFreq.toFixed(3)}</span>
+            <span style="color: rgba(255,255,255,0.5);">${centerFreq.toFixed(3)}</span>
             <span>${(centerFreq + step).toFixed(3)}</span>
             <span>${(centerFreq + halfBW/2).toFixed(3)}</span>
             <span>${(centerFreq + halfBW - step).toFixed(3)}</span>

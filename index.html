@@ -451,7 +451,7 @@
             }
         }
 
-        /* Tuning dial indicator - appears on both waterfall and waveform */
+        /* Tuning dial indicator - moveable, appears on all displays */
         .tuning-indicator {
             position: absolute;
             top: 0;
@@ -460,9 +460,23 @@
             width: 2px;
             height: 100%;
             background: var(--accent);
-            opacity: 0.8;
+            opacity: 0.9;
             pointer-events: none;
             z-index: 10;
+            transition: left 0.05s ease-out;
+        }
+
+        /* Center marker - shows the center of the display */
+        .center-marker {
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 1px;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.2);
+            pointer-events: none;
+            z-index: 5;
         }
 
         /* Prominent Frequency Control Panel - compact horizontal layout */
@@ -724,18 +738,21 @@
                 <div class="canvas-container spectrum-container" id="spectrumContainer">
                     <span class="canvas-label">Spectrum</span>
                     <canvas id="spectrumCanvas"></canvas>
-                    <div class="tuning-indicator"></div>
+                    <div class="center-marker"></div>
+                    <div class="tuning-indicator" id="spectrumIndicator"></div>
                 </div>
                 <div class="canvas-container waterfall-container" id="waterfallContainer">
                     <span class="canvas-label">Waterfall</span>
                     <canvas id="waterfallCanvas"></canvas>
-                    <div class="tuning-indicator"></div>
+                    <div class="center-marker"></div>
+                    <div class="tuning-indicator" id="waterfallIndicator"></div>
                     <div class="freq-scale" id="freqScale"></div>
                 </div>
                 <div class="canvas-container waveform-container" id="waveformContainer">
                     <span class="canvas-label">Waveform</span>
                     <canvas id="waveformCanvas"></canvas>
-                    <div class="tuning-indicator"></div>
+                    <div class="center-marker"></div>
+                    <div class="tuning-indicator" id="waveformIndicator"></div>
                 </div>
             </div>
 
