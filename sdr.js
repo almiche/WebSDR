@@ -342,11 +342,20 @@ class Visualizer {
         this.waterfallData = [];
         this.maxWaterfallLines = 400; // Increased for more granular waterfall
 
+        // Spectrum display range (in dB, relative to FFT output)
+        this.spectrumMin = -80; // dB floor
+        this.spectrumMax = 0;   // dB ceiling
+
         // Color palette for waterfall (blue to red to white)
         this.colorPalette = this.createColorPalette();
 
         this.resize();
         window.addEventListener('resize', () => this.resize());
+    }
+
+    setSpectrumRange(min, max) {
+        this.spectrumMin = min;
+        this.spectrumMax = max;
     }
 
     createColorPalette() {
@@ -355,29 +364,41 @@ class Visualizer {
             const ratio = i / 255;
             let r, g, b;
 
-            if (ratio < 0.25) {
-                // Black to blue
-                const t = ratio / 0.25;
+            if (ratio < 0.2) {
+                // Black to dark blue (noise floor)
+                const t = ratio / 0.2;
                 r = 0;
                 g = 0;
-                b = Math.floor(t * 128);
-            } else if (ratio < 0.5) {
+                b = Math.floor(t * 100);
+            } else if (ratio < 0.4) {
+                // Dark blue to blue
+                const t = (ratio - 0.2) / 0.2;
+                r = 0;
+                g = 0;
+                b = 100 + Math.floor(t * 155);
+            } else if (ratio < 0.55) {
                 // Blue to cyan
-                const t = (ratio - 0.25) / 0.25;
+                const t = (ratio - 0.4) / 0.15;
                 r = 0;
                 g = Math.floor(t * 255);
-                b = 128 + Math.floor(t * 127);
-            } else if (ratio < 0.75) {
-                // Cyan to yellow
-                const t = (ratio - 0.5) / 0.25;
-                r = Math.floor(t * 255);
+                b = 255;
+            } else if (ratio < 0.7) {
+                // Cyan to green
+                const t = (ratio - 0.55) / 0.15;
+                r = 0;
                 g = 255;
                 b = Math.floor((1 - t) * 255);
-            } else {
-                // Yellow to white
-                const t = (ratio - 0.75) / 0.25;
-                r = 255;
+            } else if (ratio < 0.85) {
+                // Green to yellow
+                const t = (ratio - 0.7) / 0.15;
+                r = Math.floor(t * 255);
                 g = 255;
+                b = 0;
+            } else {
+                // Yellow to red to white (strong signals)
+                const t = (ratio - 0.85) / 0.15;
+                r = 255;
+                g = Math.floor(255 - t * 128);
                 b = Math.floor(t * 255);
             }
 
@@ -404,7 +425,7 @@ class Visualizer {
     drawWaterfall(iq) {
         if (!iq || iq.length < this.fftSize * 2) return;
 
-        // Compute FFT magnitude
+        // Compute FFT magnitude (returns dB values)
         const fftMag = this.computeFFT(iq);
 
         // Shift existing waterfall down
@@ -422,6 +443,7 @@ class Visualizer {
         ctx.fillRect(0, 0, width, height);
 
         const lineHeight = Math.max(1, height / this.maxWaterfallLines);
+        const range = this.spectrumMax - this.spectrumMin;
 
         for (let y = 0; y < this.waterfallData.length; y++) {
             const line = this.waterfallData[y];
@@ -429,7 +451,10 @@ class Visualizer {
 
             for (let x = 0; x < width; x++) {
                 const binIndex = Math.floor(x / width * line.length);
-                const value = Math.min(255, Math.max(0, Math.floor(line[binIndex] * 2.5)));
+                // Map dB value to 0-255 using min/max range
+                const dB = line[binIndex];
+                const normalized = (dB - this.spectrumMin) / range;
+                const value = Math.min(255, Math.max(0, Math.floor(normalized * 255)));
                 ctx.fillStyle = this.colorPalette[value];
                 ctx.fillRect(x, pixelY, 1, lineHeight);
             }
@@ -443,31 +468,43 @@ class Visualizer {
         const ctx = this.spectrumCtx;
         const width = this.spectrumCanvas.width;
         const height = this.spectrumCanvas.height;
+        const range = this.spectrumMax - this.spectrumMin;
 
         // Clear with dark background
-        ctx.fillStyle = '#000';
+        ctx.fillStyle = '#0a0a14';
         ctx.fillRect(0, 0, width, height);
 
-        // Draw horizontal grid lines
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        // Draw horizontal grid lines with dB labels
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.font = '10px monospace';
         ctx.lineWidth = 1;
-        for (let i = 1; i < 4; i++) {
-            const y = (height / 4) * i;
+
+        const numGridLines = 5;
+        for (let i = 0; i <= numGridLines; i++) {
+            const dB = this.spectrumMin + (range * i / numGridLines);
+            const y = height - (i / numGridLines) * height;
+
             ctx.beginPath();
             ctx.moveTo(0, y);
             ctx.lineTo(width, y);
             ctx.stroke();
+
+            // Draw dB label
+            ctx.fillText(`${dB.toFixed(0)} dB`, 5, y - 3);
         }
 
-        // Draw spectrum line (white/cyan gradient)
+        // Draw spectrum line
         ctx.strokeStyle = 'rgba(100, 255, 218, 0.9)';
         ctx.lineWidth = 1.5;
         ctx.beginPath();
 
         for (let x = 0; x < width; x++) {
             const binIndex = Math.floor(x / width * fftMag.length);
-            const magnitude = fftMag[binIndex] / 100;
-            const y = height - magnitude * height * 0.8;
+            const dB = fftMag[binIndex];
+            // Map dB to screen position using min/max
+            const normalized = (dB - this.spectrumMin) / range;
+            const y = height - Math.max(0, Math.min(1, normalized)) * height;
 
             if (x === 0) {
                 ctx.moveTo(x, y);
@@ -478,11 +515,15 @@ class Visualizer {
 
         ctx.stroke();
 
-        // Draw filled area under the spectrum
+        // Draw filled area under the spectrum with gradient
+        const gradient = ctx.createLinearGradient(0, 0, 0, height);
+        gradient.addColorStop(0, 'rgba(100, 255, 218, 0.3)');
+        gradient.addColorStop(1, 'rgba(100, 255, 218, 0.05)');
+
         ctx.lineTo(width, height);
         ctx.lineTo(0, height);
         ctx.closePath();
-        ctx.fillStyle = 'rgba(100, 255, 218, 0.15)';
+        ctx.fillStyle = gradient;
         ctx.fill();
     }
 
@@ -501,13 +542,14 @@ class Visualizer {
         // Cooley-Tukey FFT
         this.fft(real, imag);
 
-        // Compute magnitude in dB
+        // Compute magnitude in dB (proper dBFS scale)
         const magnitude = new Float32Array(N);
         for (let i = 0; i < N; i++) {
             // Rearrange for center DC
             const idx = (i + N / 2) % N;
-            const mag = Math.sqrt(real[idx] * real[idx] + imag[idx] * imag[idx]);
-            magnitude[i] = 20 * Math.log10(Math.max(mag, 1e-10)) + 100; // Offset to positive
+            const mag = Math.sqrt(real[idx] * real[idx] + imag[idx] * imag[idx]) / N;
+            // Convert to dB with proper scaling (0 dB = full scale)
+            magnitude[i] = 20 * Math.log10(Math.max(mag, 1e-10));
         }
 
         return magnitude;
@@ -820,6 +862,26 @@ class WebSDRApp {
                 case 'am': bw = 3000 + filter * 140; break;
             }
             document.getElementById('filterValue').textContent = `${(bw / 1000).toFixed(1)} kHz`;
+        });
+
+        // Spectrum min slider
+        document.getElementById('specMinSlider').addEventListener('input', (e) => {
+            const min = parseInt(e.target.value);
+            document.getElementById('specMinValue').textContent = `${min} dB`;
+            if (this.visualizer) {
+                const max = parseInt(document.getElementById('specMaxSlider').value);
+                this.visualizer.setSpectrumRange(min, max);
+            }
+        });
+
+        // Spectrum max slider
+        document.getElementById('specMaxSlider').addEventListener('input', (e) => {
+            const max = parseInt(e.target.value);
+            document.getElementById('specMaxValue').textContent = `${max} dB`;
+            if (this.visualizer) {
+                const min = parseInt(document.getElementById('specMinSlider').value);
+                this.visualizer.setSpectrumRange(min, max);
+            }
         });
 
         // Volume slider
