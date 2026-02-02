@@ -29,9 +29,12 @@ class RTLTCPClient {
         this.CMD_SET_BIAS_TEE = 0x0E;
     }
 
-    connect(host, port) {
+    connect(host, port, secure = null) {
         return new Promise((resolve, reject) => {
-            const wsUrl = `ws://${host}:${port}`;
+            // Auto-detect: use WSS if page is loaded over HTTPS, unless explicitly specified
+            const useSecure = secure !== null ? secure : (window.location.protocol === 'https:');
+            const wsProtocol = useSecure ? 'wss' : 'ws';
+            const wsUrl = `${wsProtocol}://${host}:${port}`;
             console.log(`Connecting to ${wsUrl}`);
 
             this.ws = new WebSocket(wsUrl);
@@ -1718,11 +1721,12 @@ class WebSDRApp {
     async connect() {
         const host = document.getElementById('wsHost').value;
         const port = document.getElementById('wsPort').value;
+        const secure = document.getElementById('secureWs').checked;
 
         this.showLoading(true);
 
         try {
-            await this.rtl.connect(host, port);
+            await this.rtl.connect(host, port, secure);
             await this.audio.init();
 
             this.isConnected = true;

@@ -911,6 +911,32 @@
             background: var(--accent);
             border-color: var(--accent);
         }
+
+        /* Secure checkbox */
+        .secure-toggle {
+            display: flex;
+            align-items: center;
+        }
+
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .checkbox-label input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        .checkbox-label span {
+            text-transform: none;
+        }
     </style>
 </head>
 <body>
@@ -948,7 +974,7 @@
             <div class="connection-panel">
                 <div class="input-group">
                     <label>WebSocket Host</label>
-                    <input type="text" id="wsHost" value="192.168.1.126" placeholder="Host IP">
+                    <input type="text" id="wsHost" value="192.168.1.126" placeholder="Host IP or domain">
                 </div>
                 <div class="input-group">
                     <label>WS Port</label>
@@ -963,6 +989,12 @@
                         <option value="2048000" selected>2.048 MHz</option>
                         <option value="2400000">2.4 MHz</option>
                     </select>
+                </div>
+                <div class="input-group secure-toggle">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="secureWs" checked>
+                        <span>Secure (WSS)</span>
+                    </label>
                 </div>
                 <button class="btn-connect" id="connectBtn">Connect</button>
             </div>
