@@ -112,7 +112,7 @@ class DSPProcessor {
         this.sampleRate = sampleRate;
         this.mode = 'wfm';
         this.squelch = 0;
-        this.filterBandwidth = 15000;
+        this.filterBandwidth = 200000; // Start with WFM bandwidth
 
         // Demodulation state
         this.lastI = 0;
@@ -123,38 +123,91 @@ class DSPProcessor {
         this.audioSampleRate = 48000;
         this.decimationFactor = Math.floor(sampleRate / this.audioSampleRate);
 
-        // De-emphasis filter state (for FM)
-        this.deemphState = 0;
-        this.deemphAlpha = 1 - Math.exp(-1 / (this.audioSampleRate * 75e-6));
+        // FM deviation - broadcast FM uses ±75 kHz, NFM uses ±5 kHz
+        this.fmDeviation = 75000; // Hz
 
-        // Low-pass filter coefficients
-        this.lpfCoeffs = this.designLPF(this.filterBandwidth);
-        this.lpfBuffer = new Float32Array(this.lpfCoeffs.length);
-        this.lpfIndex = 0;
+        // De-emphasis filter state (for FM broadcast - 75µs for NA, 50µs for EU)
+        // Using a gentler de-emphasis for cleaner sound
+        this.deemphState = 0;
+        const tau = 75e-6; // 75 microseconds time constant
+        this.deemphAlpha = 1.0 / (1.0 + this.audioSampleRate * tau);
+
+        // IQ low-pass filter for pre-demodulation filtering
+        this.numFilterTaps = 63;
+        this.iqLpfCoeffs = this.designLPF(this.filterBandwidth);
+        this.iqLpfBufferI = new Float32Array(this.numFilterTaps);
+        this.iqLpfBufferQ = new Float32Array(this.numFilterTaps);
+        this.iqLpfIndex = 0;
+
+        // Audio low-pass filter (for after demodulation) - 12 kHz for smoother audio
+        this.audioLpfCoeffs = this.designAudioLPF(12000);
+        this.audioLpfBuffer = new Float32Array(this.audioLpfCoeffs.length);
+        this.audioLpfIndex = 0;
 
         // DC blocker
         this.dcBlockerState = 0;
         this.dcBlockerAlpha = 0.995;
+
+        // AM AGC (Automatic Gain Control)
+        this.amAgcGain = 1.0;
+        this.amAgcAttack = 0.01;  // Fast attack
+        this.amAgcDecay = 0.0001; // Slow decay
+        this.amAgcTarget = 0.5;   // Target output level
+
+        // AM carrier tracking for better demodulation
+        this.amDcAvg = 0;
+        this.amDcAlpha = 0.001; // Slow DC tracking for carrier
+
+        // DC spike removal (RTL-SDR has a spike at center frequency)
+        this.dcRemovalAlpha = 0.9999; // Very slow tracking
+        this.dcAvgI = 0;
+        this.dcAvgQ = 0;
+
+        // IQ imbalance correction
+        this.iqGainCorrection = 1.0;  // Amplitude imbalance
+        this.iqPhaseCorrection = 0.0; // Phase imbalance (radians)
+
+        // Noise floor estimation for better squelch
+        this.noiseFloor = 0;
+        this.noiseAlpha = 0.001;
+
+        // Squelch state (with hysteresis)
+        this.squelchOpen = true;
+
+        // FM integrator for better demod (accumulates phase)
+        this.fmIntegrator = 0;
     }
 
     setMode(mode) {
         this.mode = mode;
         switch (mode) {
             case 'wfm':
-                this.filterBandwidth = 150000;
+                this.filterBandwidth = 200000; // Full WFM bandwidth (~200 kHz)
+                this.fmDeviation = 75000; // ±75 kHz for broadcast FM
                 this.decimationFactor = Math.floor(this.sampleRate / this.audioSampleRate);
+                this.numFilterTaps = 127; // More taps for WFM
                 break;
             case 'nfm':
-                this.filterBandwidth = 12500;
+                this.filterBandwidth = 12500; // NFM channel spacing
+                this.fmDeviation = 5000; // ±5 kHz for NFM
                 this.decimationFactor = Math.floor(this.sampleRate / this.audioSampleRate);
+                this.numFilterTaps = 63;
                 break;
             case 'am':
                 this.filterBandwidth = 10000;
                 this.decimationFactor = Math.floor(this.sampleRate / this.audioSampleRate);
+                this.numFilterTaps = 63;
                 break;
         }
-        this.lpfCoeffs = this.designLPF(this.filterBandwidth);
-        this.lpfBuffer = new Float32Array(this.lpfCoeffs.length);
+        // Update IQ filter
+        this.iqLpfCoeffs = this.designLPF(this.filterBandwidth);
+        this.iqLpfBufferI = new Float32Array(this.numFilterTaps);
+        this.iqLpfBufferQ = new Float32Array(this.numFilterTaps);
+        this.iqLpfIndex = 0;
+        // Reset demod state
+        this.lastI = 0;
+        this.lastQ = 0;
+        this.fmIntegrator = 0;
     }
 
     setSquelch(level) {
@@ -168,9 +221,37 @@ class DSPProcessor {
     }
 
     designLPF(cutoff) {
+        const numTaps = this.numFilterTaps || 63;
+        const coeffs = new Float32Array(numTaps);
+        // Normalize cutoff to Nyquist frequency
+        const fc = Math.min(0.45, cutoff / this.sampleRate);
+        const middle = Math.floor(numTaps / 2);
+
+        for (let i = 0; i < numTaps; i++) {
+            const n = i - middle;
+            if (n === 0) {
+                coeffs[i] = 2 * fc;
+            } else {
+                coeffs[i] = Math.sin(2 * Math.PI * fc * n) / (Math.PI * n);
+            }
+            // Blackman window (better stopband attenuation than Hamming)
+            const w = 2 * Math.PI * i / (numTaps - 1);
+            coeffs[i] *= 0.42 - 0.5 * Math.cos(w) + 0.08 * Math.cos(2 * w);
+        }
+
+        // Normalize
+        const sum = coeffs.reduce((a, b) => a + b, 0);
+        for (let i = 0; i < numTaps; i++) {
+            coeffs[i] /= sum;
+        }
+
+        return coeffs;
+    }
+
+    designAudioLPF(cutoff) {
         const numTaps = 31;
         const coeffs = new Float32Array(numTaps);
-        const fc = cutoff / this.sampleRate;
+        const fc = cutoff / this.audioSampleRate;
         const middle = Math.floor(numTaps / 2);
 
         for (let i = 0; i < numTaps; i++) {
@@ -193,19 +274,39 @@ class DSPProcessor {
         return coeffs;
     }
 
-    applyLPF(sample) {
-        this.lpfBuffer[this.lpfIndex] = sample;
+    applyAudioLPF(sample) {
+        this.audioLpfBuffer[this.audioLpfIndex] = sample;
         let output = 0;
-        let idx = this.lpfIndex;
+        let idx = this.audioLpfIndex;
 
-        for (let i = 0; i < this.lpfCoeffs.length; i++) {
-            output += this.lpfBuffer[idx] * this.lpfCoeffs[i];
+        for (let i = 0; i < this.audioLpfCoeffs.length; i++) {
+            output += this.audioLpfBuffer[idx] * this.audioLpfCoeffs[i];
             idx--;
-            if (idx < 0) idx = this.lpfCoeffs.length - 1;
+            if (idx < 0) idx = this.audioLpfCoeffs.length - 1;
         }
 
-        this.lpfIndex = (this.lpfIndex + 1) % this.lpfCoeffs.length;
+        this.audioLpfIndex = (this.audioLpfIndex + 1) % this.audioLpfCoeffs.length;
         return output;
+    }
+
+    applyIQFilter(sampleI, sampleQ) {
+        // Store samples in circular buffer
+        this.iqLpfBufferI[this.iqLpfIndex] = sampleI;
+        this.iqLpfBufferQ[this.iqLpfIndex] = sampleQ;
+
+        let outputI = 0;
+        let outputQ = 0;
+        let idx = this.iqLpfIndex;
+
+        for (let i = 0; i < this.iqLpfCoeffs.length; i++) {
+            outputI += this.iqLpfBufferI[idx] * this.iqLpfCoeffs[i];
+            outputQ += this.iqLpfBufferQ[idx] * this.iqLpfCoeffs[i];
+            idx--;
+            if (idx < 0) idx = this.iqLpfCoeffs.length - 1;
+        }
+
+        this.iqLpfIndex = (this.iqLpfIndex + 1) % this.iqLpfCoeffs.length;
+        return { i: outputI, q: outputQ };
     }
 
     dcBlocker(sample) {
@@ -215,18 +316,34 @@ class DSPProcessor {
     }
 
     deemphasis(sample) {
-        this.deemphState = this.deemphState + this.deemphAlpha * (sample - this.deemphState);
+        // Simple first-order IIR low-pass filter for de-emphasis
+        this.deemphState = this.deemphAlpha * sample + (1 - this.deemphAlpha) * this.deemphState;
         return this.deemphState;
     }
 
-    // Convert unsigned 8-bit IQ samples to float
+    // Convert unsigned 8-bit IQ samples to float with corrections
     processIQ(data) {
         const numSamples = Math.floor(data.length / 2);
         const iq = new Float32Array(numSamples * 2);
 
         for (let i = 0; i < numSamples; i++) {
-            iq[i * 2] = (data[i * 2] - 127.5) / 127.5;     // I
-            iq[i * 2 + 1] = (data[i * 2 + 1] - 127.5) / 127.5; // Q
+            // Convert to float (-1 to 1)
+            let I = (data[i * 2] - 127.5) / 127.5;
+            let Q = (data[i * 2 + 1] - 127.5) / 127.5;
+
+            // DC spike removal - track and subtract DC offset
+            this.dcAvgI = this.dcRemovalAlpha * this.dcAvgI + (1 - this.dcRemovalAlpha) * I;
+            this.dcAvgQ = this.dcRemovalAlpha * this.dcAvgQ + (1 - this.dcRemovalAlpha) * Q;
+            I -= this.dcAvgI;
+            Q -= this.dcAvgQ;
+
+            // IQ imbalance correction (amplitude and phase)
+            // Corrects for hardware imperfections in RTL-SDR
+            Q = Q * this.iqGainCorrection;
+            const correctedQ = Q + I * this.iqPhaseCorrection;
+
+            iq[i * 2] = I;
+            iq[i * 2 + 1] = correctedQ;
         }
 
         return iq;
@@ -238,62 +355,110 @@ class DSPProcessor {
         const audio = new Float32Array(Math.floor(numSamples / this.decimationFactor));
         let audioIdx = 0;
 
+        // FM gain - normalize based on sample rate and deviation
+        // Lower gain for cleaner audio
+        const fmGain = this.sampleRate / (2 * Math.PI * this.fmDeviation) * 0.5;
+
         for (let i = 0; i < numSamples; i++) {
             const currentI = iq[i * 2];
             const currentQ = iq[i * 2 + 1];
 
-            // Quadrature demodulation
+            // Quadrature demodulation (polar discriminator)
+            // This computes the phase difference between consecutive samples
             const diffI = currentI * this.lastI + currentQ * this.lastQ;
             const diffQ = currentQ * this.lastI - currentI * this.lastQ;
 
+            // Phase difference (instantaneous frequency)
             let demod = Math.atan2(diffQ, diffI);
 
             this.lastI = currentI;
             this.lastQ = currentQ;
 
-            // Decimate
+            // Decimate to audio rate
             if (i % this.decimationFactor === 0 && audioIdx < audio.length) {
-                // Apply low-pass filter
-                demod = this.applyLPF(demod);
+                // Scale by FM gain
+                demod *= fmGain;
 
-                // Apply de-emphasis for broadcast FM
+                // Apply de-emphasis for broadcast FM (75µs time constant)
                 if (this.mode === 'wfm') {
                     demod = this.deemphasis(demod);
                 }
 
-                // DC blocker
+                // Apply audio low-pass filter to remove high frequency noise
+                demod = this.applyAudioLPF(demod);
+
+                // DC blocker to remove any DC offset
                 demod = this.dcBlocker(demod);
 
-                // Scale output
-                audio[audioIdx++] = demod * 0.5;
+                // Soft limiting for cleaner audio
+                const limited = Math.tanh(demod * 1.5);
+                audio[audioIdx++] = limited * 0.7;
             }
         }
 
         return audio;
     }
 
-    // AM demodulation using envelope detection
+    // AM demodulation using envelope detection with AGC
     demodulateAM(iq) {
         const numSamples = iq.length / 2;
         const audio = new Float32Array(Math.floor(numSamples / this.decimationFactor));
         let audioIdx = 0;
 
+        // Accumulator for decimation averaging
+        let magSum = 0;
+        let magCount = 0;
+
         for (let i = 0; i < numSamples; i++) {
-            const I = iq[i * 2];
-            const Q = iq[i * 2 + 1];
+            let I = iq[i * 2];
+            let Q = iq[i * 2 + 1];
 
-            // Envelope detection
-            let magnitude = Math.sqrt(I * I + Q * Q);
+            // Apply IQ low-pass filter before demodulation
+            const filtered = this.applyIQFilter(I, Q);
+            I = filtered.i;
+            Q = filtered.q;
 
-            // Decimate
-            if (i % this.decimationFactor === 0 && audioIdx < audio.length) {
-                // Apply low-pass filter
-                magnitude = this.applyLPF(magnitude);
+            // Envelope detection (magnitude of IQ signal)
+            const magnitude = Math.sqrt(I * I + Q * Q);
 
-                // DC blocker
-                magnitude = this.dcBlocker(magnitude);
+            // Accumulate for decimation
+            magSum += magnitude;
+            magCount++;
 
-                audio[audioIdx++] = magnitude;
+            // Decimate to audio rate by averaging
+            if (magCount >= this.decimationFactor && audioIdx < audio.length) {
+                const avgMag = magSum / magCount;
+
+                // Track the DC/carrier level (slow average)
+                this.amDcAvg = this.amDcAvg * (1 - this.amDcAlpha) + avgMag * this.amDcAlpha;
+
+                // Remove the carrier (DC component) to get audio
+                let audioSample = avgMag - this.amDcAvg;
+
+                // Apply AGC
+                const absVal = Math.abs(audioSample);
+                if (absVal > this.amAgcTarget / this.amAgcGain) {
+                    // Signal too loud - fast attack
+                    this.amAgcGain *= (1 - this.amAgcAttack);
+                } else {
+                    // Signal quiet - slow decay (increase gain)
+                    this.amAgcGain *= (1 + this.amAgcDecay);
+                }
+                // Clamp gain to reasonable range
+                this.amAgcGain = Math.max(0.1, Math.min(100, this.amAgcGain));
+
+                // Apply gain
+                audioSample *= this.amAgcGain;
+
+                // Apply audio low-pass filter
+                audioSample = this.applyAudioLPF(audioSample);
+
+                // Final clipping protection
+                audio[audioIdx++] = Math.max(-1, Math.min(1, audioSample));
+
+                // Reset accumulator
+                magSum = 0;
+                magCount = 0;
             }
         }
 
@@ -316,13 +481,32 @@ class DSPProcessor {
                 audio = this.demodulateFM(iq);
         }
 
-        // Apply squelch
+        // Apply squelch with hysteresis to prevent choppy audio
         if (this.squelch > 0) {
             const rms = Math.sqrt(audio.reduce((sum, s) => sum + s * s, 0) / audio.length);
             const threshold = this.squelch / 1000;
-            if (rms < threshold) {
-                audio.fill(0);
+            const hysteresis = threshold * 0.3; // 30% hysteresis
+
+            if (!this.squelchOpen) {
+                // Squelch is closed - need signal above threshold + hysteresis to open
+                if (rms > threshold + hysteresis) {
+                    this.squelchOpen = true;
+                }
+            } else {
+                // Squelch is open - signal must drop below threshold - hysteresis to close
+                if (rms < threshold - hysteresis) {
+                    this.squelchOpen = false;
+                }
             }
+
+            if (!this.squelchOpen) {
+                // Fade out smoothly instead of hard cut
+                for (let i = 0; i < audio.length; i++) {
+                    audio[i] *= Math.max(0, 1 - i / audio.length);
+                }
+            }
+        } else {
+            this.squelchOpen = true;
         }
 
         return { iq, audio };
@@ -346,16 +530,88 @@ class Visualizer {
         this.spectrumMin = -80; // dB floor
         this.spectrumMax = 0;   // dB ceiling
 
+        // Frequency information for grid lines
+        this.centerFrequency = 100e6; // Hz
+        this.sampleRate = 2048000;    // Hz (determines visible bandwidth)
+
+        // FFT averaging for smoother spectrum display (like SDR++)
+        this.fftAverageCount = 4; // Number of frames to average
+        this.fftAverageBuffer = null; // Will hold averaged spectrum
+        this.fftFrameCount = 0;
+
+        // Pre-rendered waterfall buffer (stores data with frequency metadata)
+        // Each entry: { fftMag: Float32Array, centerFreq: number }
+        this.waterfallBuffer = [];
+        this.maxBufferLines = 600; // Keep more lines in buffer for panning
+
+        // Off-screen canvas for smooth rendering
+        this.offscreenCanvas = document.createElement('canvas');
+        this.offscreenCtx = this.offscreenCanvas.getContext('2d');
+
         // Color palette for waterfall (blue to red to white)
         this.colorPalette = this.createColorPalette();
+
+        // Pre-compute color palette as ImageData-compatible values for speed
+        this.colorPaletteRGBA = this.createColorPaletteRGBA();
 
         this.resize();
         window.addEventListener('resize', () => this.resize());
     }
 
+    setFrequencyInfo(centerFreqHz, sampleRate) {
+        this.centerFrequency = centerFreqHz;
+        this.sampleRate = sampleRate;
+    }
+
+    createColorPaletteRGBA() {
+        const palette = new Array(256);
+        for (let i = 0; i < 256; i++) {
+            const ratio = i / 255;
+            let r, g, b;
+
+            if (ratio < 0.2) {
+                const t = ratio / 0.2;
+                r = 0; g = 0; b = Math.floor(t * 100);
+            } else if (ratio < 0.4) {
+                const t = (ratio - 0.2) / 0.2;
+                r = 0; g = 0; b = 100 + Math.floor(t * 155);
+            } else if (ratio < 0.55) {
+                const t = (ratio - 0.4) / 0.15;
+                r = 0; g = Math.floor(t * 255); b = 255;
+            } else if (ratio < 0.7) {
+                const t = (ratio - 0.55) / 0.15;
+                r = 0; g = 255; b = Math.floor((1 - t) * 255);
+            } else if (ratio < 0.85) {
+                const t = (ratio - 0.7) / 0.15;
+                r = Math.floor(t * 255); g = 255; b = 0;
+            } else {
+                const t = (ratio - 0.85) / 0.15;
+                r = 255; g = Math.floor(255 - t * 128); b = Math.floor(t * 255);
+            }
+
+            palette[i] = { r, g, b };
+        }
+        return palette;
+    }
+
     setSpectrumRange(min, max) {
         this.spectrumMin = min;
         this.spectrumMax = max;
+    }
+
+    clearWaterfall() {
+        this.waterfallData = [];
+        this.waterfallBuffer = [];
+        // Clear the waterfall canvas
+        const ctx = this.waterfallCtx;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, this.waterfallCanvas.width, this.waterfallCanvas.height);
+        // Clear offscreen canvas
+        this.offscreenCtx.fillStyle = '#000';
+        this.offscreenCtx.fillRect(0, 0, this.offscreenCanvas.width, this.offscreenCanvas.height);
+        // Reset FFT averaging buffer
+        this.fftAverageBuffer = null;
+        this.fftFrameCount = 0;
     }
 
     createColorPalette() {
@@ -420,6 +676,10 @@ class Visualizer {
 
         this.waveformCanvas.width = waveformRect.width;
         this.waveformCanvas.height = waveformRect.height;
+
+        // Resize offscreen canvas to match (with extra width for pre-rendering)
+        this.offscreenCanvas.width = waterfallRect.width * 3; // 3x width for left/right buffer
+        this.offscreenCanvas.height = waterfallRect.height - 20;
     }
 
     drawWaterfall(iq) {
@@ -428,40 +688,112 @@ class Visualizer {
         // Compute FFT magnitude (returns dB values)
         const fftMag = this.computeFFT(iq);
 
-        // Shift existing waterfall down
+        // Store FFT data with frequency metadata in buffer
+        if (this.waterfallBuffer.length >= this.maxBufferLines) {
+            this.waterfallBuffer.shift();
+        }
+        this.waterfallBuffer.push({
+            fftMag: fftMag,
+            centerFreq: this.centerFrequency,
+            sampleRate: this.sampleRate
+        });
+
+        // Also maintain legacy waterfallData for compatibility
         if (this.waterfallData.length >= this.maxWaterfallLines) {
             this.waterfallData.shift();
         }
         this.waterfallData.push(fftMag);
 
-        // Draw waterfall (color display only, no spectrum overlay)
+        // Draw waterfall using ImageData for better performance
         const ctx = this.waterfallCtx;
         const width = this.waterfallCanvas.width;
         const height = this.waterfallCanvas.height;
 
-        ctx.fillStyle = '#000';
-        ctx.fillRect(0, 0, width, height);
+        // Create ImageData for the entire waterfall
+        const imageData = ctx.createImageData(width, height);
+        const data = imageData.data;
 
-        const lineHeight = Math.max(1, height / this.maxWaterfallLines);
+        const lineHeight = Math.max(1, Math.ceil(height / this.maxWaterfallLines));
         const range = this.spectrumMax - this.spectrumMin;
 
-        for (let y = 0; y < this.waterfallData.length; y++) {
-            const line = this.waterfallData[y];
-            const pixelY = height - (y + 1) * lineHeight;
+        // Current view frequency range
+        const viewStartFreq = this.centerFrequency - this.sampleRate / 2;
+        const viewEndFreq = this.centerFrequency + this.sampleRate / 2;
 
-            for (let x = 0; x < width; x++) {
-                const binIndex = Math.floor(x / width * line.length);
-                // Map dB value to 0-255 using min/max range
-                const dB = line[binIndex];
-                const normalized = (dB - this.spectrumMin) / range;
-                const value = Math.min(255, Math.max(0, Math.floor(normalized * 255)));
-                ctx.fillStyle = this.colorPalette[value];
-                ctx.fillRect(x, pixelY, 1, lineHeight);
+        // Render waterfall lines with frequency-aware positioning
+        for (let y = 0; y < this.waterfallBuffer.length; y++) {
+            const entry = this.waterfallBuffer[y];
+            const line = entry.fftMag;
+            const lineStartFreq = entry.centerFreq - entry.sampleRate / 2;
+            const lineEndFreq = entry.centerFreq + entry.sampleRate / 2;
+
+            const pixelY = Math.floor(height - (y + 1) * lineHeight);
+            if (pixelY < 0 || pixelY >= height) continue;
+
+            // Draw multiple pixel rows for line height
+            for (let ly = 0; ly < lineHeight && (pixelY + ly) < height; ly++) {
+                const rowY = pixelY + ly;
+                if (rowY < 0) continue;
+
+                for (let x = 0; x < width; x++) {
+                    // Map screen x to frequency
+                    const freq = viewStartFreq + (x / width) * this.sampleRate;
+
+                    // Check if this frequency is within the stored line's range
+                    if (freq >= lineStartFreq && freq <= lineEndFreq) {
+                        // Map frequency to bin index in stored FFT data
+                        const binRatio = (freq - lineStartFreq) / entry.sampleRate;
+                        const binIndex = Math.floor(binRatio * line.length);
+
+                        if (binIndex >= 0 && binIndex < line.length) {
+                            const dB = line[binIndex];
+                            const normalized = (dB - this.spectrumMin) / range;
+                            const colorIdx = Math.min(255, Math.max(0, Math.floor(normalized * 255)));
+                            const color = this.colorPaletteRGBA[colorIdx];
+
+                            const idx = (rowY * width + x) * 4;
+                            data[idx] = color.r;
+                            data[idx + 1] = color.g;
+                            data[idx + 2] = color.b;
+                            data[idx + 3] = 255;
+                        }
+                    }
+                    // Frequencies outside stored range remain black (already 0)
+                }
             }
         }
 
+        ctx.putImageData(imageData, 0, 0);
+
+        // Draw 100 kHz grid lines on waterfall
+        this.drawWaterfallGrid(ctx, width, height);
+
         // Draw spectrum on its own canvas
         this.drawSpectrum(fftMag);
+    }
+
+    drawWaterfallGrid(ctx, width, height) {
+        const bandwidth = this.sampleRate;
+        const startFreq = this.centerFrequency - bandwidth / 2;
+        const endFreq = this.centerFrequency + bandwidth / 2;
+        const gridSpacing = 100000; // 100 kHz
+
+        // Find first grid line position (round up to nearest 100 kHz)
+        const firstGridFreq = Math.ceil(startFreq / gridSpacing) * gridSpacing;
+
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.setLineDash([2, 4]); // Dashed line for waterfall
+
+        for (let freq = firstGridFreq; freq <= endFreq; freq += gridSpacing) {
+            const x = ((freq - startFreq) / bandwidth) * width;
+
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, height);
+            ctx.stroke();
+        }
+
+        ctx.setLineDash([]); // Reset dash pattern
     }
 
     drawSpectrum(fftMag) {
@@ -493,6 +825,38 @@ class Visualizer {
             // Draw dB label
             ctx.fillText(`${dB.toFixed(0)} dB`, 5, y - 3);
         }
+
+        // Draw vertical frequency grid lines at 100 kHz intervals
+        const bandwidth = this.sampleRate; // Total visible bandwidth
+        const startFreq = this.centerFrequency - bandwidth / 2;
+        const endFreq = this.centerFrequency + bandwidth / 2;
+        const gridSpacing = 100000; // 100 kHz
+
+        // Find first grid line position (round up to nearest 100 kHz)
+        const firstGridFreq = Math.ceil(startFreq / gridSpacing) * gridSpacing;
+
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'center';
+
+        for (let freq = firstGridFreq; freq <= endFreq; freq += gridSpacing) {
+            // Calculate x position
+            const x = ((freq - startFreq) / bandwidth) * width;
+
+            // Draw vertical line
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, height);
+            ctx.stroke();
+
+            // Draw frequency label at bottom
+            const freqMHz = freq / 1e6;
+            const label = freqMHz >= 1000 ? `${(freqMHz / 1000).toFixed(2)}G` : `${freqMHz.toFixed(1)}`;
+            ctx.fillText(label, x, height - 5);
+        }
+
+        ctx.textAlign = 'left'; // Reset text alignment
 
         // Draw spectrum line
         ctx.strokeStyle = 'rgba(100, 255, 218, 0.9)';
@@ -532,9 +896,11 @@ class Visualizer {
         const real = new Float32Array(N);
         const imag = new Float32Array(N);
 
-        // Copy IQ data and apply window
+        // Copy IQ data and apply Blackman-Harris window (better dynamic range than Hanning)
         for (let i = 0; i < N && i * 2 + 1 < iq.length; i++) {
-            const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N); // Hanning
+            const a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
+            const x = 2 * Math.PI * i / (N - 1);
+            const window = a0 - a1 * Math.cos(x) + a2 * Math.cos(2 * x) - a3 * Math.cos(3 * x);
             real[i] = iq[i * 2] * window;
             imag[i] = iq[i * 2 + 1] * window;
         }
@@ -552,7 +918,19 @@ class Visualizer {
             magnitude[i] = 20 * Math.log10(Math.max(mag, 1e-10));
         }
 
-        return magnitude;
+        // Apply FFT averaging for smoother display
+        if (!this.fftAverageBuffer || this.fftAverageBuffer.length !== N) {
+            this.fftAverageBuffer = new Float32Array(magnitude);
+            this.fftFrameCount = 1;
+        } else {
+            // Exponential moving average for smooth response
+            const alpha = 0.3; // Higher = more responsive, lower = smoother
+            for (let i = 0; i < N; i++) {
+                this.fftAverageBuffer[i] = alpha * magnitude[i] + (1 - alpha) * this.fftAverageBuffer[i];
+            }
+        }
+
+        return this.fftAverageBuffer;
     }
 
     fft(real, imag) {
@@ -649,6 +1027,11 @@ class AudioPlayer {
         this.bufferQueue = [];
         this.nextStartTime = 0;
         this.bufferDuration = 0.1; // 100ms buffers
+
+        // Recording state
+        this.isRecording = false;
+        this.recordedChunks = [];
+        this.recordingStartTime = null;
     }
 
     async init() {
@@ -668,6 +1051,9 @@ class AudioPlayer {
 
     play(audioData) {
         if (!this.audioCtx || !this.playing) return;
+
+        // Add to recording if active
+        this.addRecordingData(audioData);
 
         const buffer = this.audioCtx.createBuffer(1, audioData.length, 48000);
         buffer.getChannelData(0).set(audioData);
@@ -708,6 +1094,124 @@ class AudioPlayer {
         const sum = audioData.reduce((acc, s) => acc + s * s, 0);
         return Math.sqrt(sum / audioData.length);
     }
+
+    // Recording functions
+    startRecording() {
+        this.isRecording = true;
+        this.recordedChunks = [];
+        this.recordingStartTime = Date.now();
+        console.log('Recording started');
+    }
+
+    stopRecording() {
+        this.isRecording = false;
+        console.log('Recording stopped');
+        return this.exportRecording();
+    }
+
+    addRecordingData(audioData) {
+        if (this.isRecording && audioData && audioData.length > 0) {
+            // Clone the data since it might be reused
+            this.recordedChunks.push(new Float32Array(audioData));
+        }
+    }
+
+    getRecordingDuration() {
+        if (!this.recordingStartTime) return 0;
+        return (Date.now() - this.recordingStartTime) / 1000;
+    }
+
+    exportRecording() {
+        if (this.recordedChunks.length === 0) {
+            console.warn('No audio recorded');
+            return null;
+        }
+
+        // Calculate total length
+        const totalLength = this.recordedChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const sampleRate = 48000;
+
+        // Merge all chunks
+        const mergedAudio = new Float32Array(totalLength);
+        let offset = 0;
+        for (const chunk of this.recordedChunks) {
+            mergedAudio.set(chunk, offset);
+            offset += chunk.length;
+        }
+
+        // Create WAV file
+        const wavBlob = this.createWavBlob(mergedAudio, sampleRate);
+
+        // Generate filename with timestamp
+        const now = new Date();
+        const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const filename = `recording_${timestamp}.wav`;
+
+        // Download the file
+        const url = URL.createObjectURL(wavBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        console.log(`Exported ${(totalLength / sampleRate).toFixed(1)}s of audio as ${filename}`);
+
+        // Clear recorded data
+        this.recordedChunks = [];
+        this.recordingStartTime = null;
+
+        return filename;
+    }
+
+    createWavBlob(audioData, sampleRate) {
+        const numChannels = 1;
+        const bitsPerSample = 16;
+        const bytesPerSample = bitsPerSample / 8;
+        const blockAlign = numChannels * bytesPerSample;
+        const byteRate = sampleRate * blockAlign;
+        const dataSize = audioData.length * bytesPerSample;
+        const headerSize = 44;
+        const totalSize = headerSize + dataSize;
+
+        const buffer = new ArrayBuffer(totalSize);
+        const view = new DataView(buffer);
+
+        // Write WAV header
+        const writeString = (offset, str) => {
+            for (let i = 0; i < str.length; i++) {
+                view.setUint8(offset + i, str.charCodeAt(i));
+            }
+        };
+
+        writeString(0, 'RIFF');
+        view.setUint32(4, totalSize - 8, true);
+        writeString(8, 'WAVE');
+        writeString(12, 'fmt ');
+        view.setUint32(16, 16, true); // fmt chunk size
+        view.setUint16(20, 1, true);  // PCM format
+        view.setUint16(22, numChannels, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, byteRate, true);
+        view.setUint16(32, blockAlign, true);
+        view.setUint16(34, bitsPerSample, true);
+        writeString(36, 'data');
+        view.setUint32(40, dataSize, true);
+
+        // Write audio data (convert float to 16-bit PCM)
+        let offset = 44;
+        for (let i = 0; i < audioData.length; i++) {
+            // Clamp to [-1, 1] and convert to 16-bit signed integer
+            const sample = Math.max(-1, Math.min(1, audioData[i]));
+            const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+            view.setInt16(offset, int16, true);
+            offset += 2;
+        }
+
+        return new Blob([buffer], { type: 'audio/wav' });
+    }
 }
 
 // Main Application
@@ -736,6 +1240,14 @@ class WebSDRApp {
         this.tuneOffset = 0; // Hz offset from center where we're tuned
         this.indicatorPosition = 50; // Percentage position of the indicator (0-100)
 
+        // Throttle timer for RTL updates during dragging
+        this.rtlUpdateTimer = null;
+        this.lastRtlUpdateFreq = 100.0;
+
+        // Recording state
+        this.isRecording = false;
+        this.recordingTimer = null;
+
         this.init();
     }
 
@@ -750,7 +1262,7 @@ class WebSDRApp {
         this.bindEvents();
 
         // Initialize frequency from input
-        const initialFreq = parseFloat(document.getElementById('frequency').value);
+        const initialFreq = parseFloat(document.getElementById('frequencyDisplay').value);
         this.centerFrequency = initialFreq;
         this.tuneOffset = 0;
         this.indicatorPosition = 50;
@@ -759,6 +1271,9 @@ class WebSDRApp {
         this.updateFrequencyDisplay(initialFreq);
         this.updateIndicatorPosition();
         this.updateFreqScale();
+
+        // Initialize bookmark system
+        this.initBookmarks();
     }
 
     bindEvents() {
@@ -774,6 +1289,11 @@ class WebSDRApp {
         // Play button
         document.getElementById('playBtn').addEventListener('click', () => {
             this.toggleAudio();
+        });
+
+        // Record button
+        document.getElementById('recordBtn').addEventListener('click', () => {
+            this.toggleRecording();
         });
 
         // Main frequency display input (the big red one)
@@ -1055,23 +1575,20 @@ class WebSDRApp {
         });
     }
 
-    // SDR++ style: Click moves the indicator to that position
+    // Click tunes to that frequency - actually retunes the SDR
     handleCanvasTune(e, canvas) {
         const rect = canvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const width = rect.width;
 
-        // Move the indicator to the clicked position
-        this.indicatorPosition = (x / width) * 100;
-        this.updateIndicatorPosition();
-
-        // Calculate the actual frequency at this position
+        // Calculate the frequency at the clicked position
         const sampleRate = parseInt(document.getElementById('sampleRate').value);
-        this.tuneOffset = (this.indicatorPosition / 100 - 0.5) * sampleRate;
+        const clickRatio = x / width; // 0 to 1 across the display
+        const freqOffset = (clickRatio - 0.5) * sampleRate; // Offset from center in Hz
+        const clickedFreqMHz = this.centerFrequency + (freqOffset / 1e6);
 
-        // Calculate and set the tuned frequency
-        const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
-        this.setTunedFrequency(tunedFreq);
+        // Retune to the clicked frequency (this becomes the new center)
+        this.setFrequency(clickedFreqMHz);
     }
 
     // Update the visual position of all indicator lines
@@ -1085,6 +1602,7 @@ class WebSDRApp {
     // Set the center frequency of the display (for panning)
     setCenterFrequency(freqMHz, sendToRTL = true) {
         freqMHz = Math.max(24, Math.min(1766, freqMHz));
+        const oldCenterFreq = this.centerFrequency;
         this.centerFrequency = freqMHz;
 
         // Update the frequency scale
@@ -1094,24 +1612,58 @@ class WebSDRApp {
         const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
 
         // Update displays
-        document.getElementById('frequency').value = tunedFreq.toFixed(3);
+        document.getElementById('frequencyDisplay').value = tunedFreq.toFixed(3);
         this.updateFrequencyDisplay(tunedFreq);
+
+        // Clear waterfall when frequency changes significantly (more than 10% of bandwidth)
+        const sampleRate = parseInt(document.getElementById('sampleRate').value);
+        const freqChange = Math.abs(freqMHz - oldCenterFreq) * 1e6;
+        if (freqChange > sampleRate * 0.1 && this.visualizer) {
+            this.visualizer.clearWaterfall();
+        }
+
+        // Update visualizer with frequency info for grid lines
+        if (this.visualizer) {
+            this.visualizer.setFrequencyInfo(freqMHz * 1e6, sampleRate);
+        }
 
         if (sendToRTL && this.isConnected) {
             this.rtl.setFrequency(tunedFreq * 1e6);
+            this.lastRtlUpdateFreq = tunedFreq;
+        } else if (!sendToRTL && this.isConnected) {
+            // During dragging, send throttled updates (every 100ms)
+            if (!this.rtlUpdateTimer) {
+                this.rtlUpdateTimer = setTimeout(() => {
+                    const currentTunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
+                    this.rtl.setFrequency(currentTunedFreq * 1e6);
+                    this.lastRtlUpdateFreq = currentTunedFreq;
+                    if (this.visualizer) {
+                        this.visualizer.clearWaterfall();
+                    }
+                    this.rtlUpdateTimer = null;
+                }, 100);
+            }
         }
     }
 
     // Set the tuned frequency (where the red line is)
+    // This updates where the SDR is tuned but keeps the display centered on current view
     setTunedFrequency(freqMHz, sendToRTL = true) {
         freqMHz = Math.max(24, Math.min(1766, freqMHz));
 
         // Update displays
-        document.getElementById('frequency').value = freqMHz.toFixed(3);
+        document.getElementById('frequencyDisplay').value = freqMHz.toFixed(3);
         this.updateFrequencyDisplay(freqMHz);
+
+        // Update visualizer with actual tuned frequency for correct spectrum display
+        const sampleRate = parseInt(document.getElementById('sampleRate').value);
+        if (this.visualizer) {
+            this.visualizer.setFrequencyInfo(freqMHz * 1e6, sampleRate);
+        }
 
         if (sendToRTL && this.isConnected) {
             this.rtl.setFrequency(freqMHz * 1e6);
+            this.lastRtlUpdateFreq = freqMHz;
         }
     }
 
@@ -1132,9 +1684,19 @@ class WebSDRApp {
         // Update frequency scale
         this.updateFreqScale();
 
+        // Clear waterfall when frequency changes
+        if (this.visualizer) {
+            this.visualizer.clearWaterfall();
+            // Update visualizer with frequency info for grid lines
+            const sampleRate = parseInt(document.getElementById('sampleRate').value);
+            this.visualizer.setFrequencyInfo(freqMHz * 1e6, sampleRate);
+        }
+
         // Send to RTL-TCP if connected
         if (sendToRTL && this.isConnected) {
+            console.log(`Tuning to ${freqMHz.toFixed(3)} MHz`);
             this.rtl.setFrequency(freqMHz * 1e6);
+            this.lastRtlUpdateFreq = freqMHz;
         }
     }
 
@@ -1167,7 +1729,7 @@ class WebSDRApp {
             this.updateConnectionUI(true);
 
             // Set initial parameters
-            const freqMHz = parseFloat(document.getElementById('frequency').value);
+            const freqMHz = parseFloat(document.getElementById('frequencyDisplay').value);
             const sampleRate = parseInt(document.getElementById('sampleRate').value);
             const gain = parseInt(document.getElementById('gainSlider').value);
 
@@ -1180,6 +1742,12 @@ class WebSDRApp {
             this.rtl.setSampleRate(sampleRate);
             this.rtl.setGain(gain);
             this.dsp.setSampleRate(sampleRate);
+
+            // Update visualizer with frequency info for grid lines
+            if (this.visualizer) {
+                this.visualizer.setFrequencyInfo(freqMHz * 1e6, sampleRate);
+                this.visualizer.clearWaterfall();
+            }
 
             // Update displays
             this.updateFrequencyDisplay(freqMHz);
@@ -1263,6 +1831,49 @@ class WebSDRApp {
         }
     }
 
+    toggleRecording() {
+        if (!this.isPlaying) {
+            this.showToast('Start playback first to record');
+            return;
+        }
+
+        this.isRecording = !this.isRecording;
+        const recordBtn = document.getElementById('recordBtn');
+        const recordingTime = document.getElementById('recordingTime');
+
+        if (this.isRecording) {
+            // Start recording
+            this.audio.startRecording();
+            recordBtn.classList.add('recording');
+            recordBtn.textContent = '⏹';
+            recordBtn.title = 'Stop recording';
+
+            // Update recording time display
+            this.recordingTimer = setInterval(() => {
+                const duration = this.audio.getRecordingDuration();
+                const mins = Math.floor(duration / 60);
+                const secs = Math.floor(duration % 60);
+                recordingTime.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+            }, 100);
+
+            this.showToast('Recording started');
+        } else {
+            // Stop recording and export
+            clearInterval(this.recordingTimer);
+            this.recordingTimer = null;
+
+            const filename = this.audio.stopRecording();
+            recordBtn.classList.remove('recording');
+            recordBtn.textContent = '⏺';
+            recordBtn.title = 'Record audio';
+            recordingTime.textContent = '';
+
+            if (filename) {
+                this.showToast(`Saved: ${filename}`);
+            }
+        }
+    }
+
     updateStats(audio, iq) {
         // Buffer size
         document.getElementById('bufferStat').textContent =
@@ -1339,6 +1950,170 @@ class WebSDRApp {
         toast.textContent = message;
         toast.classList.add('show');
         setTimeout(() => toast.classList.remove('show'), 3000);
+    }
+
+    // ========== Bookmark System ==========
+
+    initBookmarks() {
+        // Load bookmarks from cookies
+        this.bookmarks = this.loadBookmarks();
+
+        // Menu toggle
+        document.getElementById('menuBtn').addEventListener('click', () => this.openMenu());
+        document.getElementById('menuCloseBtn').addEventListener('click', () => this.closeMenu());
+        document.getElementById('menuOverlay').addEventListener('click', () => this.closeMenu());
+
+        // Add bookmark button
+        document.getElementById('addBookmarkBtn').addEventListener('click', () => this.addCurrentBookmark());
+
+        // Enter key in label input
+        document.getElementById('bookmarkLabel').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') this.addCurrentBookmark();
+        });
+
+        // Preset buttons
+        document.querySelectorAll('.preset-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const freq = parseFloat(btn.dataset.freq);
+                const mode = btn.dataset.mode;
+                this.tuneToBookmark(freq, mode);
+                this.closeMenu();
+            });
+        });
+
+        // Render bookmarks
+        this.renderBookmarks();
+    }
+
+    openMenu() {
+        document.getElementById('sideMenu').classList.add('active');
+        document.getElementById('menuOverlay').classList.add('active');
+    }
+
+    closeMenu() {
+        document.getElementById('sideMenu').classList.remove('active');
+        document.getElementById('menuOverlay').classList.remove('active');
+    }
+
+    // Cookie utilities
+    setCookie(name, value, days = 365) {
+        const expires = new Date(Date.now() + days * 864e5).toUTCString();
+        document.cookie = `${name}=${encodeURIComponent(JSON.stringify(value))}; expires=${expires}; path=/; SameSite=Strict`;
+    }
+
+    getCookie(name) {
+        const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+        if (match) {
+            try {
+                return JSON.parse(decodeURIComponent(match[2]));
+            } catch (e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    loadBookmarks() {
+        return this.getCookie('websdr_bookmarks') || [];
+    }
+
+    saveBookmarks() {
+        this.setCookie('websdr_bookmarks', this.bookmarks);
+    }
+
+    addCurrentBookmark() {
+        const labelInput = document.getElementById('bookmarkLabel');
+        const label = labelInput.value.trim() || `${this.centerFrequency.toFixed(3)} MHz`;
+        const freq = this.centerFrequency;
+        const mode = this.dsp.mode;
+
+        // Check for duplicate
+        const exists = this.bookmarks.some(b => Math.abs(b.freq - freq) < 0.001);
+        if (exists) {
+            this.showToast('Frequency already bookmarked');
+            return;
+        }
+
+        this.bookmarks.push({
+            id: Date.now(),
+            freq: freq,
+            label: label,
+            mode: mode
+        });
+
+        this.saveBookmarks();
+        this.renderBookmarks();
+
+        // Clear input
+        labelInput.value = '';
+        this.showToast(`Bookmarked ${freq.toFixed(3)} MHz`);
+    }
+
+    deleteBookmark(id) {
+        this.bookmarks = this.bookmarks.filter(b => b.id !== id);
+        this.saveBookmarks();
+        this.renderBookmarks();
+        this.showToast('Bookmark deleted');
+    }
+
+    tuneToBookmark(freq, mode) {
+        // Set mode first
+        if (mode && mode !== this.dsp.mode) {
+            this.dsp.setMode(mode);
+            document.querySelectorAll('.mode-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.mode === mode);
+            });
+        }
+
+        // Tune to frequency
+        this.setFrequency(freq);
+    }
+
+    renderBookmarks() {
+        const list = document.getElementById('bookmarkList');
+
+        if (this.bookmarks.length === 0) {
+            list.innerHTML = '<div class="no-bookmarks">No bookmarks yet. Add your favorite frequencies!</div>';
+            return;
+        }
+
+        // Sort by frequency
+        const sorted = [...this.bookmarks].sort((a, b) => a.freq - b.freq);
+
+        list.innerHTML = sorted.map(bookmark => `
+            <div class="bookmark-item" data-id="${bookmark.id}" data-freq="${bookmark.freq}" data-mode="${bookmark.mode}">
+                <span class="bookmark-freq">${bookmark.freq.toFixed(3)}</span>
+                <span class="bookmark-label">${this.escapeHtml(bookmark.label)}</span>
+                <span class="bookmark-mode">${bookmark.mode.toUpperCase()}</span>
+                <button class="bookmark-delete" data-id="${bookmark.id}" title="Delete">×</button>
+            </div>
+        `).join('');
+
+        // Add click handlers
+        list.querySelectorAll('.bookmark-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                if (e.target.classList.contains('bookmark-delete')) return;
+                const freq = parseFloat(item.dataset.freq);
+                const mode = item.dataset.mode;
+                this.tuneToBookmark(freq, mode);
+                this.closeMenu();
+            });
+        });
+
+        // Delete button handlers
+        list.querySelectorAll('.bookmark-delete').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const id = parseInt(btn.dataset.id);
+                this.deleteBookmark(id);
+            });
+        });
+    }
+
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
     }
 }
 
