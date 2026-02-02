@@ -29,11 +29,9 @@ class RTLTCPClient {
         this.CMD_SET_BIAS_TEE = 0x0E;
     }
 
-    connect(host, port, secure = null) {
+    connect(host, port, secure = false) {
         return new Promise((resolve, reject) => {
-            // Auto-detect: use WSS if page is loaded over HTTPS, unless explicitly specified
-            const useSecure = secure !== null ? secure : (window.location.protocol === 'https:');
-            const wsProtocol = useSecure ? 'wss' : 'ws';
+            const wsProtocol = secure ? 'wss' : 'ws';
             const wsUrl = `${wsProtocol}://${host}:${port}`;
             console.log(`Connecting to ${wsUrl}`);
 
