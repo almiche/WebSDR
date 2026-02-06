@@ -973,6 +973,13 @@
             <!-- Connection Panel -->
             <div class="connection-panel">
                 <div class="input-group">
+                    <label>Backend</label>
+                    <select id="backendSelect">
+                        <option value="rtltcp" selected>rtl_tcp</option>
+                        <option value="sdrserver">sdr-server</option>
+                    </select>
+                </div>
+                <div class="input-group">
                     <label>WebSocket Host</label>
                     <input type="text" id="wsHost" value="192.168.1.126" placeholder="Host IP or domain">
                 </div>
@@ -983,6 +990,8 @@
                 <div class="input-group">
                     <label>Sample Rate</label>
                     <select id="sampleRate">
+                        <option value="48000">48 kHz</option>
+                        <option value="96000">96 kHz</option>
                         <option value="250000">250 kHz</option>
                         <option value="1024000">1.024 MHz</option>
                         <option value="1800000">1.8 MHz</option>

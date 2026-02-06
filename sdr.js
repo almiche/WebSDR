@@ -1,9 +1,143 @@
 /**
- * WebSDR - RTL-TCP Web Client
+ * WebSDR - Multi-backend SDR Web Client
+ * Supports RTL-TCP (via websockify) and sdr-server (via websockify or bridge)
  * Full-featured SDR client with WFM, NFM, AM demodulation
  * Waterfall and waveform visualization
  */
 
+// Backend types
+const SDR_BACKEND_RTLTCP = 'rtltcp';
+const SDR_BACKEND_SDRSERVER = 'sdrserver';
+
+/**
+ * sdr-server Client
+ * Protocol: JSON commands over WebSocket, float32 complex IQ data stream
+ * Server-side decimation means lower bandwidth requirements
+ */
+class SDRServerClient {
+    constructor() {
+        this.ws = null;
+        this.connected = false;
+        this.frequency = 100000000; // 100 MHz default
+        this.sampleRate = 48000;    // sdr-server uses lower rates (decimated)
+        this.bandFreq = 100000000;  // Band center (first client sets this)
+        this.gain = 0;
+        this.isFloat32 = false;     // Whether receiving float32 or uint8 data
+    }
+
+    connect(host, port, secure = false, options = {}) {
+        return new Promise((resolve, reject) => {
+            const wsProtocol = secure ? 'wss' : 'ws';
+            const wsUrl = `${wsProtocol}://${host}:${port}`;
+            console.log(`Connecting to sdr-server bridge at ${wsUrl}`);
+
+            this.ws = new WebSocket(wsUrl);
+            this.ws.binaryType = 'arraybuffer';
+            this.isFloat32 = options.float32 || false;
+
+            this.ws.onopen = () => {
+                console.log('WebSocket connected to sdr-server bridge');
+                // Send connect request
+                const connectMsg = {
+                    action: 'connect',
+                    center_freq: this.frequency,
+                    sampling_rate: this.sampleRate,
+                    band_freq: options.bandFreq || this.frequency
+                };
+                this.ws.send(JSON.stringify(connectMsg));
+            };
+
+            this.ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+                reject(new Error('WebSocket connection failed'));
+            };
+
+            this.ws.onclose = () => {
+                console.log('WebSocket closed');
+                this.connected = false;
+                if (this.onDisconnect) this.onDisconnect();
+            };
+
+            this.ws.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    // JSON message (status, error, etc.)
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === 'connected') {
+                            console.log('sdr-server stream started');
+                            this.connected = true;
+                            resolve();
+                        } else if (msg.type === 'error') {
+                            console.error('sdr-server error:', msg.message);
+                            reject(new Error(msg.message));
+                        } else if (msg.type === 'disconnected') {
+                            this.connected = false;
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse message:', e);
+                    }
+                } else {
+                    // Binary IQ data
+                    if (this.onData) {
+                        if (this.isFloat32) {
+                            // Convert float32 complex to uint8 IQ for DSP compatibility
+                            const float32Data = new Float32Array(event.data);
+                            const numSamples = float32Data.length / 2;
+                            const uint8Data = new Uint8Array(numSamples * 2);
+
+                            for (let i = 0; i < numSamples; i++) {
+                                const I = float32Data[i * 2];
+                                const Q = float32Data[i * 2 + 1];
+                                // Convert from float [-1, 1] to uint8 [0, 255]
+                                uint8Data[i * 2] = Math.max(0, Math.min(255, Math.round((I + 1) * 127.5)));
+                                uint8Data[i * 2 + 1] = Math.max(0, Math.min(255, Math.round((Q + 1) * 127.5)));
+                            }
+                            this.onData(uint8Data);
+                        } else {
+                            // Already uint8 IQ data
+                            this.onData(new Uint8Array(event.data));
+                        }
+                    }
+                }
+            };
+        });
+    }
+
+    disconnect() {
+        if (this.ws) {
+            // Send disconnect message
+            if (this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ action: 'disconnect' }));
+            }
+            this.ws.close();
+            this.ws = null;
+        }
+        this.connected = false;
+    }
+
+    setFrequency(freqHz) {
+        this.frequency = Math.round(freqHz);
+        // sdr-server requires reconnection to change frequency
+        // For now, just log - full implementation would reconnect
+        console.log(`sdr-server: frequency change to ${(this.frequency / 1e6).toFixed(3)} MHz requires reconnect`);
+        // TODO: Implement automatic reconnect with new frequency
+    }
+
+    setSampleRate(rate) {
+        this.sampleRate = rate;
+        console.log(`sdr-server: sample rate change to ${rate} requires reconnect`);
+    }
+
+    setGain(gain) {
+        // sdr-server doesn't support gain changes - it's set on the server
+        this.gain = gain;
+        console.log(`sdr-server: gain is controlled server-side`);
+    }
+}
+
+/**
+ * RTL-TCP Client (original implementation)
+ */
 class RTLTCPClient {
     constructor() {
         this.ws = null;
@@ -95,14 +229,17 @@ class RTLTCPClient {
 
     setGain(gain) {
         if (gain === 0) {
-            // Enable AGC
-            this.sendCommand(this.CMD_SET_AGC_MODE, 1);
-            this.sendCommand(this.CMD_SET_GAIN_MODE, 0);
+            // Enable AGC (automatic gain control)
+            this.sendCommand(this.CMD_SET_GAIN_MODE, 0); // Auto gain mode first
+            this.sendCommand(this.CMD_SET_AGC_MODE, 1);  // Enable AGC
+            console.log('Set gain: AGC (Auto)');
         } else {
-            // Manual gain (value is in tenths of dB)
-            this.sendCommand(this.CMD_SET_AGC_MODE, 0);
-            this.sendCommand(this.CMD_SET_GAIN_MODE, 1);
+            // Manual gain - set mode first, then value
+            // RTL-SDR gain is in tenths of dB (e.g., 40 dB = 400)
+            this.sendCommand(this.CMD_SET_GAIN_MODE, 1); // Manual gain mode first
+            this.sendCommand(this.CMD_SET_AGC_MODE, 0);  // Disable AGC
             this.sendCommand(this.CMD_SET_GAIN, gain * 10);
+            console.log(`Set gain: ${gain} dB (${gain * 10} tenths)`);
         }
         this.gain = gain;
     }
@@ -357,12 +494,21 @@ class DSPProcessor {
         let audioIdx = 0;
 
         // FM gain - normalize based on sample rate and deviation
-        // Lower gain for cleaner audio
-        const fmGain = this.sampleRate / (2 * Math.PI * this.fmDeviation) * 0.5;
+        const fmGain = this.sampleRate / (2 * Math.PI * this.fmDeviation) * 0.4;
+
+        // Accumulators for proper decimation (anti-aliasing)
+        let demodSum = 0;
+        let demodCount = 0;
 
         for (let i = 0; i < numSamples; i++) {
-            const currentI = iq[i * 2];
-            const currentQ = iq[i * 2 + 1];
+            let currentI = iq[i * 2];
+            let currentQ = iq[i * 2 + 1];
+
+            // Apply IQ low-pass filter before demodulation (critical for FM!)
+            // This removes out-of-band noise that would create artifacts
+            const filtered = this.applyIQFilter(currentI, currentQ);
+            currentI = filtered.i;
+            currentQ = filtered.q;
 
             // Quadrature demodulation (polar discriminator)
             // This computes the phase difference between consecutive samples
@@ -370,30 +516,39 @@ class DSPProcessor {
             const diffQ = currentQ * this.lastI - currentI * this.lastQ;
 
             // Phase difference (instantaneous frequency)
+            // Use atan2 for full quadrant detection
             let demod = Math.atan2(diffQ, diffI);
 
             this.lastI = currentI;
             this.lastQ = currentQ;
 
-            // Decimate to audio rate
-            if (i % this.decimationFactor === 0 && audioIdx < audio.length) {
-                // Scale by FM gain
-                demod *= fmGain;
+            // Scale by FM gain
+            demod *= fmGain;
+
+            // Accumulate for proper decimation (averaging prevents aliasing)
+            demodSum += demod;
+            demodCount++;
+
+            // Decimate to audio rate by averaging
+            if (demodCount >= this.decimationFactor && audioIdx < audio.length) {
+                let sample = demodSum / demodCount;
+                demodSum = 0;
+                demodCount = 0;
 
                 // Apply de-emphasis for broadcast FM (75µs time constant)
                 if (this.mode === 'wfm') {
-                    demod = this.deemphasis(demod);
+                    sample = this.deemphasis(sample);
                 }
 
-                // Apply audio low-pass filter to remove high frequency noise
-                demod = this.applyAudioLPF(demod);
+                // Apply audio low-pass filter
+                sample = this.applyAudioLPF(sample);
 
                 // DC blocker to remove any DC offset
-                demod = this.dcBlocker(demod);
+                sample = this.dcBlocker(sample);
 
-                // Soft limiting for cleaner audio
-                const limited = Math.tanh(demod * 1.5);
-                audio[audioIdx++] = limited * 0.7;
+                // Soft limiting for cleaner audio (gentler curve)
+                const limited = Math.tanh(sample);
+                audio[audioIdx++] = limited * 0.8;
             }
         }
 
@@ -554,6 +709,43 @@ class Visualizer {
 
         // Pre-compute color palette as ImageData-compatible values for speed
         this.colorPaletteRGBA = this.createColorPaletteRGBA();
+
+        // Frequency band definitions (in Hz) with colors
+        this.frequencyBands = [
+            // LF/MF
+            { start: 0, end: 530e3, name: 'LW', color: 'rgba(128, 128, 128, 0.4)' },
+            { start: 530e3, end: 1700e3, name: 'MW/AM', color: 'rgba(255, 200, 100, 0.4)' },
+            // HF
+            { start: 1700e3, end: 3500e3, name: '160m', color: 'rgba(255, 100, 100, 0.3)' },
+            { start: 3500e3, end: 4000e3, name: '80m', color: 'rgba(255, 150, 50, 0.4)' },
+            { start: 5330e3, end: 5410e3, name: '60m', color: 'rgba(255, 180, 50, 0.4)' },
+            { start: 7000e3, end: 7300e3, name: '40m', color: 'rgba(255, 255, 50, 0.4)' },
+            { start: 10100e3, end: 10150e3, name: '30m', color: 'rgba(200, 255, 50, 0.4)' },
+            { start: 14000e3, end: 14350e3, name: '20m', color: 'rgba(100, 255, 100, 0.4)' },
+            { start: 18068e3, end: 18168e3, name: '17m', color: 'rgba(50, 255, 150, 0.4)' },
+            { start: 21000e3, end: 21450e3, name: '15m', color: 'rgba(50, 255, 200, 0.4)' },
+            { start: 24890e3, end: 24990e3, name: '12m', color: 'rgba(50, 200, 255, 0.4)' },
+            { start: 26965e3, end: 27405e3, name: 'CB', color: 'rgba(200, 150, 255, 0.4)' },
+            { start: 28000e3, end: 29700e3, name: '10m', color: 'rgba(100, 150, 255, 0.4)' },
+            // VHF
+            { start: 50e6, end: 54e6, name: '6m', color: 'rgba(150, 100, 255, 0.4)' },
+            { start: 54e6, end: 88e6, name: 'VHF TV', color: 'rgba(100, 100, 100, 0.3)' },
+            { start: 88e6, end: 108e6, name: 'FM Radio', color: 'rgba(255, 100, 150, 0.5)' },
+            { start: 108e6, end: 137e6, name: 'Air', color: 'rgba(100, 200, 255, 0.4)' },
+            { start: 137e6, end: 138e6, name: 'NOAA Sat', color: 'rgba(50, 255, 200, 0.4)' },
+            { start: 144e6, end: 148e6, name: '2m', color: 'rgba(255, 200, 50, 0.5)' },
+            { start: 148e6, end: 174e6, name: 'VHF Gov', color: 'rgba(150, 150, 150, 0.3)' },
+            { start: 162.4e6, end: 162.55e6, name: 'NOAA WX', color: 'rgba(50, 200, 255, 0.5)' },
+            // UHF
+            { start: 420e6, end: 450e6, name: '70cm', color: 'rgba(255, 150, 50, 0.5)' },
+            { start: 450e6, end: 470e6, name: 'UHF Bus', color: 'rgba(150, 150, 200, 0.3)' },
+            { start: 462e6, end: 467e6, name: 'FRS/GMRS', color: 'rgba(100, 255, 150, 0.5)' },
+            { start: 470e6, end: 698e6, name: 'UHF TV', color: 'rgba(100, 100, 100, 0.3)' },
+            { start: 824e6, end: 849e6, name: 'Cell', color: 'rgba(255, 100, 100, 0.3)' },
+            { start: 869e6, end: 894e6, name: 'Cell', color: 'rgba(255, 100, 100, 0.3)' },
+            { start: 902e6, end: 928e6, name: '33cm', color: 'rgba(200, 100, 255, 0.4)' },
+            { start: 1240e6, end: 1300e6, name: '23cm', color: 'rgba(150, 50, 255, 0.4)' },
+        ];
 
         this.resize();
         window.addEventListener('resize', () => this.resize());
@@ -890,6 +1082,78 @@ class Visualizer {
         ctx.closePath();
         ctx.fillStyle = gradient;
         ctx.fill();
+
+        // Draw band overlay at the bottom
+        this.drawBandOverlay(ctx, width, height, startFreq, endFreq);
+    }
+
+    drawBandOverlay(ctx, width, height, startFreq, endFreq) {
+        const bandHeight = 18; // Height of the band overlay bar
+        const bandY = height - bandHeight;
+        const bandwidth = endFreq - startFreq;
+
+        // Draw semi-transparent background for the band bar
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(0, bandY, width, bandHeight);
+
+        // Draw each band that falls within the visible range
+        for (const band of this.frequencyBands) {
+            // Check if band overlaps with visible range
+            if (band.end < startFreq || band.start > endFreq) continue;
+
+            // Calculate visible portion of the band
+            const visibleStart = Math.max(band.start, startFreq);
+            const visibleEnd = Math.min(band.end, endFreq);
+
+            // Convert to pixel positions
+            const x1 = ((visibleStart - startFreq) / bandwidth) * width;
+            const x2 = ((visibleEnd - startFreq) / bandwidth) * width;
+            const bandWidth = x2 - x1;
+
+            // Only draw if wide enough to be visible
+            if (bandWidth < 2) continue;
+
+            // Draw the band rectangle
+            ctx.fillStyle = band.color;
+            ctx.fillRect(x1, bandY + 1, bandWidth, bandHeight - 2);
+
+            // Draw border on left edge
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(x1, bandY + 1);
+            ctx.lineTo(x1, bandY + bandHeight - 1);
+            ctx.stroke();
+
+            // Draw label if band is wide enough
+            if (bandWidth > 25) {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+                ctx.font = 'bold 9px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+
+                // Truncate label if band is narrow
+                let label = band.name;
+                const labelX = x1 + bandWidth / 2;
+                const labelY = bandY + bandHeight / 2;
+
+                // Measure text and truncate if needed
+                const textWidth = ctx.measureText(label).width;
+                if (textWidth > bandWidth - 4) {
+                    // Try shorter version or skip
+                    if (bandWidth > 15) {
+                        label = label.substring(0, 2);
+                    } else {
+                        continue; // Too narrow for any label
+                    }
+                }
+
+                ctx.fillText(label, labelX, labelY);
+            }
+        }
+
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
     }
 
     computeFFT(iq) {
@@ -1218,7 +1482,11 @@ class AudioPlayer {
 // Main Application
 class WebSDRApp {
     constructor() {
-        this.rtl = new RTLTCPClient();
+        // Backend selection: 'rtltcp' or 'sdrserver'
+        this.backend = SDR_BACKEND_RTLTCP;
+        this.sdrClient = null;  // Will be RTLTCPClient or SDRServerClient
+        this.rtl = new RTLTCPClient();  // Keep for backwards compatibility
+
         this.dsp = new DSPProcessor(2048000);
         this.visualizer = null;
         this.audio = new AudioPlayer();
@@ -1250,6 +1518,11 @@ class WebSDRApp {
         this.recordingTimer = null;
 
         this.init();
+    }
+
+    // Get the active SDR client (rtl_tcp or sdr-server)
+    get activeClient() {
+        return this.sdrClient || this.rtl;
     }
 
     init() {
@@ -1435,9 +1708,7 @@ class WebSDRApp {
         });
 
         // Setup canvas interactions (click, drag, touch) for all visualization canvases
-        this.setupCanvasInteraction('spectrumCanvas');
-        this.setupCanvasInteraction('waterfallCanvas');
-        this.setupCanvasInteraction('waveformCanvas');
+        this.setupCanvasInteractions();
 
         // Keyboard shortcuts for frequency tuning
         document.addEventListener('keydown', (e) => {
@@ -1469,25 +1740,81 @@ class WebSDRApp {
         });
     }
 
-    // Setup click, drag, and touch interactions for a canvas
-    setupCanvasInteraction(canvasId) {
-        const canvas = document.getElementById(canvasId);
+    // Setup click, drag, and touch interactions for all canvases
+    setupCanvasInteractions() {
+        const canvasIds = ['spectrumCanvas', 'waterfallCanvas', 'waveformCanvas'];
+        let activeCanvas = null;
         let startX = 0;
         let startCenterFreq = 0;
         let hasMoved = false;
         let isMouseDown = false;
 
-        // Mouse events
-        canvas.addEventListener('mousedown', (e) => {
-            isMouseDown = true;
-            hasMoved = false;
-            startX = e.clientX;
-            startCenterFreq = this.centerFrequency;
-            e.preventDefault();
+        // Add mousedown to each canvas
+        canvasIds.forEach(canvasId => {
+            const canvas = document.getElementById(canvasId);
+
+            canvas.addEventListener('mousedown', (e) => {
+                activeCanvas = canvas;
+                isMouseDown = true;
+                hasMoved = false;
+                startX = e.clientX;
+                startCenterFreq = this.centerFrequency;
+                e.preventDefault();
+            });
+
+            // Touch events per canvas
+            canvas.addEventListener('touchstart', (e) => {
+                if (e.touches.length === 1) {
+                    activeCanvas = canvas;
+                    isMouseDown = true;
+                    hasMoved = false;
+                    startX = e.touches[0].clientX;
+                    startCenterFreq = this.centerFrequency;
+                }
+            }, { passive: true });
+
+            canvas.addEventListener('touchmove', (e) => {
+                if (!isMouseDown || e.touches.length !== 1 || activeCanvas !== canvas) return;
+
+                const deltaX = e.touches[0].clientX - startX;
+
+                if (Math.abs(deltaX) > 3) {
+                    hasMoved = true;
+                    this.isDragging = true;
+                    e.preventDefault();
+
+                    const rect = canvas.getBoundingClientRect();
+                    const sampleRate = parseInt(document.getElementById('sampleRate').value);
+
+                    const freqShift = -(deltaX / rect.width) * sampleRate;
+                    const newCenterFreq = startCenterFreq + (freqShift / 1e6);
+
+                    this.setCenterFrequency(newCenterFreq, false);
+                }
+            }, { passive: false });
+
+            canvas.addEventListener('touchend', () => {
+                if (activeCanvas !== canvas) return;
+                if (!isMouseDown) return;
+                isMouseDown = false;
+
+                if (hasMoved) {
+                    const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
+                    if (this.isConnected) {
+                        this.rtl.setFrequency(tunedFreq * 1e6);
+                    }
+                }
+                // Note: touchend doesn't provide position, so no click-to-tune on touch
+
+                this.isDragging = false;
+                hasMoved = false;
+                activeCanvas = null;
+            });
         });
 
-        const handleMouseMove = (e) => {
-            if (!isMouseDown) return;
+        // Single document-level mousemove handler
+        document.addEventListener('mousemove', (e) => {
+            if (!isMouseDown || !activeCanvas) return;
 
             const deltaX = e.clientX - startX;
 
@@ -1496,7 +1823,7 @@ class WebSDRApp {
                 hasMoved = true;
                 this.isDragging = true;
 
-                const rect = canvas.getBoundingClientRect();
+                const rect = activeCanvas.getBoundingClientRect();
                 const sampleRate = parseInt(document.getElementById('sampleRate').value);
 
                 // Pan: dragging right = lower freq, dragging left = higher freq
@@ -1505,10 +1832,11 @@ class WebSDRApp {
 
                 this.setCenterFrequency(newCenterFreq, false);
             }
-        };
+        });
 
-        const handleMouseUp = (e) => {
-            if (!isMouseDown) return;
+        // Single document-level mouseup handler
+        document.addEventListener('mouseup', (e) => {
+            if (!isMouseDown || !activeCanvas) return;
             isMouseDown = false;
 
             if (hasMoved) {
@@ -1519,60 +1847,12 @@ class WebSDRApp {
                 }
             } else {
                 // It was a click, not a drag - tune to clicked position
-                this.handleCanvasTune(e, canvas);
+                this.handleCanvasTune(e, activeCanvas);
             }
 
             this.isDragging = false;
             hasMoved = false;
-        };
-
-        document.addEventListener('mousemove', handleMouseMove);
-        document.addEventListener('mouseup', handleMouseUp);
-
-        // Touch events
-        canvas.addEventListener('touchstart', (e) => {
-            if (e.touches.length === 1) {
-                isMouseDown = true;
-                hasMoved = false;
-                startX = e.touches[0].clientX;
-                startCenterFreq = this.centerFrequency;
-            }
-        }, { passive: true });
-
-        canvas.addEventListener('touchmove', (e) => {
-            if (!isMouseDown || e.touches.length !== 1) return;
-
-            const deltaX = e.touches[0].clientX - startX;
-
-            if (Math.abs(deltaX) > 3) {
-                hasMoved = true;
-                this.isDragging = true;
-                e.preventDefault();
-
-                const rect = canvas.getBoundingClientRect();
-                const sampleRate = parseInt(document.getElementById('sampleRate').value);
-
-                const freqShift = -(deltaX / rect.width) * sampleRate;
-                const newCenterFreq = startCenterFreq + (freqShift / 1e6);
-
-                this.setCenterFrequency(newCenterFreq, false);
-            }
-        }, { passive: false });
-
-        canvas.addEventListener('touchend', (e) => {
-            if (!isMouseDown) return;
-            isMouseDown = false;
-
-            if (hasMoved) {
-                const tunedFreq = this.centerFrequency + (this.tuneOffset / 1e6);
-                if (this.isConnected) {
-                    this.rtl.setFrequency(tunedFreq * 1e6);
-                }
-            }
-            // Note: touchend doesn't provide position, so no click-to-tune on touch
-
-            this.isDragging = false;
-            hasMoved = false;
+            activeCanvas = null;
         });
     }
 
@@ -1693,10 +1973,18 @@ class WebSDRApp {
             this.visualizer.setFrequencyInfo(freqMHz * 1e6, sampleRate);
         }
 
-        // Send to RTL-TCP if connected
+        // Send frequency change to SDR backend
         if (sendToRTL && this.isConnected) {
             console.log(`Tuning to ${freqMHz.toFixed(3)} MHz`);
-            this.rtl.setFrequency(freqMHz * 1e6);
+            if (this.backend === SDR_BACKEND_SDRSERVER && this.sdrClient) {
+                // sdr-server requires reconnection for frequency changes
+                // For now, just update the client's frequency - full retune requires reconnect
+                this.sdrClient.setFrequency(freqMHz * 1e6);
+                // TODO: Implement automatic reconnection with new frequency
+            } else {
+                // rtl_tcp supports on-the-fly frequency changes
+                this.rtl.setFrequency(freqMHz * 1e6);
+            }
             this.lastRtlUpdateFreq = freqMHz;
         }
     }
@@ -1721,29 +2009,60 @@ class WebSDRApp {
         const port = document.getElementById('wsPort').value;
         const secure = document.getElementById('secureWs').checked;
 
+        // Check for backend selection
+        const backendSelect = document.getElementById('backendSelect');
+        this.backend = backendSelect ? backendSelect.value : SDR_BACKEND_RTLTCP;
+
         this.showLoading(true);
 
         try {
-            await this.rtl.connect(host, port, secure);
+            // Get initial parameters
+            const freqMHz = parseFloat(document.getElementById('frequencyDisplay').value);
+            const sampleRate = parseInt(document.getElementById('sampleRate').value);
+            const gain = parseInt(document.getElementById('gainSlider').value);
+
+            // Create appropriate client based on backend
+            if (this.backend === SDR_BACKEND_SDRSERVER) {
+                this.sdrClient = new SDRServerClient();
+                this.sdrClient.frequency = freqMHz * 1e6;
+                this.sdrClient.sampleRate = sampleRate;
+
+                await this.sdrClient.connect(host, port, secure, {
+                    bandFreq: freqMHz * 1e6  // First client sets the band
+                });
+
+                // sdr-server already decimates, so use its sample rate
+                this.dsp.setSampleRate(sampleRate);
+
+                // Set up data handler
+                this.sdrClient.onData = (data) => this.handleData(data);
+                this.sdrClient.onDisconnect = () => this.handleDisconnect();
+
+                console.log(`Connected to sdr-server (${sampleRate} Hz output)`);
+            } else {
+                // RTL-TCP backend (default)
+                this.sdrClient = this.rtl;
+                await this.rtl.connect(host, port, secure);
+
+                this.rtl.setFrequency(freqMHz * 1e6);
+                this.rtl.setSampleRate(sampleRate);
+                this.rtl.setGain(gain);
+                this.dsp.setSampleRate(sampleRate);
+
+                // Set up data handler
+                this.rtl.onData = (data) => this.handleData(data);
+                this.rtl.onDisconnect = () => this.handleDisconnect();
+            }
+
             await this.audio.init();
 
             this.isConnected = true;
             this.updateConnectionUI(true);
 
-            // Set initial parameters
-            const freqMHz = parseFloat(document.getElementById('frequencyDisplay').value);
-            const sampleRate = parseInt(document.getElementById('sampleRate').value);
-            const gain = parseInt(document.getElementById('gainSlider').value);
-
             // Initialize frequency model
             this.centerFrequency = freqMHz;
             this.tuneOffset = 0;
             this.indicatorPosition = 50;
-
-            this.rtl.setFrequency(freqMHz * 1e6);
-            this.rtl.setSampleRate(sampleRate);
-            this.rtl.setGain(gain);
-            this.dsp.setSampleRate(sampleRate);
 
             // Update visualizer with frequency info for grid lines
             if (this.visualizer) {
@@ -1756,11 +2075,8 @@ class WebSDRApp {
             this.updateIndicatorPosition();
             this.updateFreqScale();
 
-            // Set up data handler
-            this.rtl.onData = (data) => this.handleData(data);
-            this.rtl.onDisconnect = () => this.handleDisconnect();
-
-            this.showToast('Connected successfully');
+            const backendName = this.backend === SDR_BACKEND_SDRSERVER ? 'sdr-server' : 'rtl_tcp';
+            this.showToast(`Connected to ${backendName}`);
 
         } catch (err) {
             console.error('Connection failed:', err);
@@ -1771,10 +2087,15 @@ class WebSDRApp {
     }
 
     disconnect() {
-        this.rtl.disconnect();
+        if (this.sdrClient) {
+            this.sdrClient.disconnect();
+        } else {
+            this.rtl.disconnect();
+        }
         this.audio.stop();
         this.isConnected = false;
         this.isPlaying = false;
+        this.sdrClient = null;
         this.updateConnectionUI(false);
         this.showToast('Disconnected');
     }
